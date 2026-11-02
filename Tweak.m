@@ -856,6 +856,39 @@ static NSString *RYReport(void) {
 
 #pragma mark - Core
 
+#pragma mark Invites engine
+static NSMutableSet *gInvDone; static int gInvIdle; static NSTimer *gInvTimer; static NSTimeInterval gInvLast;
+static UIScrollView *RYBiggestList(void) {
+    __block UIScrollView *best = nil; __block CGFloat ba = 0;
+    for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
+        if (!([x isKindOfClass:UITableView.class] || [x isKindOfClass:UICollectionView.class]) || x.hidden || !x.window || x.alpha < 0.05) return;
+        CGRect f = CGRectIntersection([x convertRect:x.bounds toView:nil], x.window.bounds); CGFloat a = f.size.width * f.size.height;
+        if (a > ba) { ba = a; best = (UIScrollView *)x; }
+    });
+    return best;
+}
+static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv) {
+    if ([sv isKindOfClass:UITableView.class]) return ((UITableView *)sv).visibleCells;
+    return ((UICollectionView *)sv).visibleCells;
+}
+static void RYCellTexts(UIView *v, NSMutableString *o, int d) {
+    if (d > 10) return;
+    if ([v isKindOfClass:UILabel.class] && ((UILabel *)v).text.length) [o appendFormat:@"%@|", ((UILabel *)v).text];
+    for (UIView *s in v.subviews) RYCellTexts(s, o, d + 1);
+}
+// the invite control inside a row: key contains an invite word, and none of the "already done" words
+static UIControl *RYInviteCtl(UIView *cell) {
+    NSMutableArray *c = [NSMutableArray new]; RYCollectCtl(cell, c, 0);
+    NSArray *good = @[@"invite", @"دعو", @"دعوه", @"add to room", @"person.badge.plus", @"plus"];
+    NSArray *bad = @[@"invited", @"تمت", @"تم ", @"sent", @"pending", @"remove", @"block", @"report", @"unfriend", @"chat", @"message"];
+    for (UIControl *b in c) {
+        NSString *k = RYCtlKey(b); BOOL skip = NO;
+        for (NSString *w in bad) if ([k containsString:w]) { skip = YES; break; }
+        if (skip) continue;
+        for (NSString *w in good) if ([k containsString:w]) return b;
+    }
+    return nil;
+}
 @implementation RYCore
 + (instancetype)shared { static RYCore *c; static dispatch_once_t t; dispatch_once(&t, ^{ c = [RYCore new]; }); return c; }
 - (void)bump { self.stamp++; }
@@ -930,42 +963,6 @@ static NSString *RYReport(void) {
     RYClearBig(host, host, self.bgView, 0);
     if (self.bgView.stamp != self.stamp) { [self.bgView apply]; self.bgView.stamp = self.stamp; }
 }
-@end
-
-#pragma mark Invites engine
-static NSMutableSet *gInvDone; static int gInvIdle; static NSTimer *gInvTimer; static NSTimeInterval gInvLast;
-static UIScrollView *RYBiggestList(void) {
-    __block UIScrollView *best = nil; __block CGFloat ba = 0;
-    for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
-        if (!([x isKindOfClass:UITableView.class] || [x isKindOfClass:UICollectionView.class]) || x.hidden || !x.window || x.alpha < 0.05) return;
-        CGRect f = CGRectIntersection([x convertRect:x.bounds toView:nil], x.window.bounds); CGFloat a = f.size.width * f.size.height;
-        if (a > ba) { ba = a; best = (UIScrollView *)x; }
-    });
-    return best;
-}
-static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv) {
-    if ([sv isKindOfClass:UITableView.class]) return ((UITableView *)sv).visibleCells;
-    return ((UICollectionView *)sv).visibleCells;
-}
-static void RYCellTexts(UIView *v, NSMutableString *o, int d) {
-    if (d > 10) return;
-    if ([v isKindOfClass:UILabel.class] && ((UILabel *)v).text.length) [o appendFormat:@"%@|", ((UILabel *)v).text];
-    for (UIView *s in v.subviews) RYCellTexts(s, o, d + 1);
-}
-// the invite control inside a row: key contains an invite word, and none of the "already done" words
-static UIControl *RYInviteCtl(UIView *cell) {
-    NSMutableArray *c = [NSMutableArray new]; RYCollectCtl(cell, c, 0);
-    NSArray *good = @[@"invite", @"دعو", @"دعوه", @"add to room", @"person.badge.plus", @"plus"];
-    NSArray *bad = @[@"invited", @"تمت", @"تم ", @"sent", @"pending", @"remove", @"block", @"report", @"unfriend", @"chat", @"message"];
-    for (UIControl *b in c) {
-        NSString *k = RYCtlKey(b); BOOL skip = NO;
-        for (NSString *w in bad) if ([k containsString:w]) { skip = YES; break; }
-        if (skip) continue;
-        for (NSString *w in good) if ([k containsString:w]) return b;
-    }
-    return nil;
-}
-@implementation RYCore (Invites)
 - (NSInteger)invCooldownLeft { if (!gInvLast) return 0; NSInteger l = (NSInteger)(240 - ([NSDate date].timeIntervalSince1970 - gInvLast)); return l > 0 ? l : 0; }
 - (void)stopInvites {
     [gInvTimer invalidate]; gInvTimer = nil;
@@ -997,9 +994,6 @@ static UIControl *RYInviteCtl(UIView *cell) {
     [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
     gInvIdle = 0;
 }
-@end
-
-@implementation RYCore (Messaging)
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
     UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
     UIViewController *chat = RYFindVC(CF(@"chatClass", RY_CHAT_DEFAULT));
