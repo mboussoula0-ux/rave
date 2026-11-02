@@ -1,4 +1,4 @@
-// RaveRayane — local feature set for Rave on iPhone (injected dylib)
+// Layan — local feature set for Rave on iPhone (injected dylib)
 // Pure Objective-C runtime: no Substrate / no Logos, so it works with Feather / ESign / Sideloadly injection.
 // UNTESTED on a device: class names are tunable from Settings > Advanced.
 
@@ -146,6 +146,25 @@ static UIImage *RYGradImage(NSString *pair) {
 }
 
 #pragma mark - View-controller discovery
+#pragma mark - Visibility (hidden pre-loaded screens must not count as "on screen")
+
+static BOOL RYVisible(UIView *v) {
+    if (!v.window) return NO;
+    for (UIView *p = v; p; p = p.superview) if (p.hidden || p.alpha < 0.05) return NO;
+    CGRect f = CGRectIntersection([v convertRect:v.bounds toView:nil], v.window.bounds);
+    return !CGRectIsNull(f) && f.size.width > 40 && f.size.height > 40;
+}
+static UIScrollView *RYBiggestList(void);
+static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv);
+static void RYCellTexts(UIView *v, NSMutableString *o, int d);
+static id RYInviteCtl(UIView *cell);
+static void RYScanAll(UIViewController *vc, NSString *needle, int d, NSMutableArray *out) {
+    if (!vc || d > 14) return;
+    if ([NSStringFromClass(vc.class) containsString:needle] && vc.isViewLoaded && vc.view.window) [out addObject:vc];
+    for (UIViewController *c in vc.childViewControllers) RYScanAll(c, needle, d + 1, out);
+    RYScanAll(vc.presentedViewController, needle, d + 1, out);
+}
+
 
 @class RYWindow;
 static UIViewController *RYScan(UIViewController *vc, NSString *needle, int d) {
@@ -249,18 +268,25 @@ static NSString *RYRepl(NSString *s) {
                                            options:NSRegularExpressionSearch | NSCaseInsensitiveSearch range:NSMakeRange(0, s.length)];
 }
 static UIImage *RYTextImage(NSString *t, CGSize sz, UIColor *c) {
-    CGFloat fs = MAX(10, sz.height * 0.8); NSDictionary *a = nil; CGSize ts = CGSizeZero;
-    for (int k = 0; k < 14; k++) {
-        a = @{NSFontAttributeName: [UIFont systemFontOfSize:fs weight:UIFontWeightHeavy], NSForegroundColorAttributeName: c};
+    static NSCache *cache; if (!cache) cache = [NSCache new];
+    NSString *ck = [NSString stringWithFormat:@"%@|%.0fx%.0f|%@", t, sz.width, sz.height, RYHexFrom(c)];
+    UIImage *hit = [cache objectForKey:ck]; if (hit) return hit;
+    CGFloat fs = MAX(10, sz.height * 0.85); NSDictionary *a = nil; CGSize ts = CGSizeZero;
+    for (int k = 0; k < 16; k++) {
+        UIFont *f = [UIFont systemFontOfSize:fs weight:UIFontWeightBlack];
+        UIFontDescriptor *rd = [f.fontDescriptor fontDescriptorWithDesign:UIFontDescriptorSystemDesignRounded];
+        if (rd) f = [UIFont fontWithDescriptor:rd size:fs];
+        a = @{NSFontAttributeName: f, NSForegroundColorAttributeName: c, NSKernAttributeName: @(fs * 0.02)};
         ts = [t sizeWithAttributes:a];
         if (ts.width <= sz.width && ts.height <= sz.height) break;
-        fs *= 0.85;
+        fs *= 0.88;
     }
     NSDictionary *fa = a; CGSize fts = ts;
     UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz];
-    return [r imageWithActions:^(UIGraphicsImageRendererContext *x) {
+    UIImage *out = [r imageWithActions:^(UIGraphicsImageRendererContext *x) {
         [t drawAtPoint:CGPointMake((sz.width - fts.width) / 2, (sz.height - fts.height) / 2) withAttributes:fa];
     }];
+    [cache setObject:out forKey:ck]; return out;
 }
 static void RYBrandWalk(UIView *v, NSArray *toks) {
     if ([v isKindOfClass:UIImageView.class]) {
@@ -522,6 +548,28 @@ static NSString *RYReport(void) {
             for (id e in a) [o appendFormat:@"   A11Y %@ %@\n", NSStringFromClass([e class]), RYClip(RYA11yKey(e), 70)];
         }
     });
+    [o appendString:@"\n-- invite screen --\n"];
+    {
+        NSMutableArray *vcs = [NSMutableArray new];
+        for (UIWindow *w in RYAppWindows()) RYScanAll(w.rootViewController, CF(@"inviteClass", @"FriendsManagementViewController"), 0, vcs);
+        [o appendFormat:@"invite VCs: %lu, visible: ", (unsigned long)vcs.count];
+        int vis = 0; for (UIViewController *vc in vcs) if (RYVisible(vc.view)) vis++;
+        [o appendFormat:@"%d\n", vis];
+        UIScrollView *l = RYBiggestList();
+        if (!l) [o appendString:@"NO visible list (open the Invite/Friends screen first)\n"];
+        else {
+            [o appendFormat:@"list %@ %.0fx%.0f\n", NSStringFromClass(l.class), l.bounds.size.width, l.bounds.size.height];
+            int n = 0;
+            for (UIView *c in RYVisibleCells(l)) {
+                if (n++ >= 5) break;
+                NSMutableString *t = [NSMutableString new]; RYCellTexts(c, t, 0);
+                id b = RYInviteCtl(c);
+                [o appendFormat:@"CELL %@ texts=%@ invite=%@\n", NSStringFromClass(c.class), RYClip(t, 50), b ? (([b isKindOfClass:UIControl.class]) ? RYClip(RYCtlKey(b), 50) : RYClip(RYA11yKey(b), 50)) : @"NONE"];
+                NSMutableArray *ax = [NSMutableArray new]; RYA11yCollect(c, ax, 0);
+                for (id e in ax) [o appendFormat:@"   A11Y %@ %@\n", NSStringFromClass([e class]), RYClip(RYA11yKey(e), 70)];
+            }
+        }
+    }
     [o appendString:@"\n-- logo candidates --\n"];
     for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
         if (o.length > 18000 || x.hidden || !x.window) return;
@@ -884,23 +932,28 @@ static NSString *RYReport(void) {
 
 #pragma mark Invites engine
 static NSMutableSet *gInvDone; static int gInvIdle; static NSTimer *gInvTimer; static NSTimeInterval gInvLast;
+static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv);
+static id RYInviteCtl(UIView *cell);
 static UIScrollView *RYListIn(UIView *root) {
-    __block UIScrollView *best = nil; __block CGFloat ba = 0;
+    __block UIScrollView *best = nil; __block CGFloat ba = 0; __block BOOL bestHasInvite = NO;
     RYWalk(root, 0, ^(UIView *x, int d) {
-        if (!([x isKindOfClass:UITableView.class] || [x isKindOfClass:UICollectionView.class]) || x.hidden || !x.window || x.alpha < 0.05) return;
+        if (!([x isKindOfClass:UITableView.class] || [x isKindOfClass:UICollectionView.class]) || !RYVisible(x)) return;
         CGRect f = CGRectIntersection([x convertRect:x.bounds toView:nil], x.window.bounds); if (CGRectIsNull(f)) return;
         CGFloat a = f.size.width * f.size.height;
-        if (a > ba) { ba = a; best = (UIScrollView *)x; }
+        BOOL has = NO;
+        for (UIView *c in RYVisibleCells((UIScrollView *)x)) { if (RYInviteCtl(c)) { has = YES; break; } }
+        if ((has && !bestHasInvite) || (has == bestHasInvite && a > ba)) { ba = a; best = (UIScrollView *)x; bestHasInvite = has; }
     });
     return best;
 }
-// prefer the invite-friends screen (Rave.FriendsManagementViewController); the room chat list is bigger and would win otherwise
+// prefer the visible invite-friends screen; the room chat list is bigger and would win otherwise
 static UIScrollView *RYBiggestList(void) {
-    UIViewController *vc = RYFindVC(CF(@"inviteClass", @"FriendsManagementViewController"));
-    UIScrollView *l = vc ? RYListIn(vc.view) : nil;
-    if (l) return l;
-    for (UIWindow *w in RYAppWindows()) { UIScrollView *x = RYListIn(w); if (x) return x; }
-    return nil;
+    NSMutableArray *vcs = [NSMutableArray new];
+    for (UIWindow *w in RYAppWindows()) RYScanAll(w.rootViewController, CF(@"inviteClass", @"FriendsManagementViewController"), 0, vcs);
+    for (UIViewController *vc in vcs) { if (!RYVisible(vc.view)) continue; UIScrollView *l = RYListIn(vc.view); if (l) return l; }
+    UIScrollView *best = nil;
+    for (UIWindow *w in RYAppWindows()) { UIScrollView *x = RYListIn(w); if (x) { best = x; break; } }
+    return best;
 }
 static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv) {
     if ([sv isKindOfClass:UITableView.class]) return ((UITableView *)sv).visibleCells;
