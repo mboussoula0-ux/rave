@@ -884,14 +884,23 @@ static NSString *RYReport(void) {
 
 #pragma mark Invites engine
 static NSMutableSet *gInvDone; static int gInvIdle; static NSTimer *gInvTimer; static NSTimeInterval gInvLast;
-static UIScrollView *RYBiggestList(void) {
+static UIScrollView *RYListIn(UIView *root) {
     __block UIScrollView *best = nil; __block CGFloat ba = 0;
-    for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
+    RYWalk(root, 0, ^(UIView *x, int d) {
         if (!([x isKindOfClass:UITableView.class] || [x isKindOfClass:UICollectionView.class]) || x.hidden || !x.window || x.alpha < 0.05) return;
-        CGRect f = CGRectIntersection([x convertRect:x.bounds toView:nil], x.window.bounds); CGFloat a = f.size.width * f.size.height;
+        CGRect f = CGRectIntersection([x convertRect:x.bounds toView:nil], x.window.bounds); if (CGRectIsNull(f)) return;
+        CGFloat a = f.size.width * f.size.height;
         if (a > ba) { ba = a; best = (UIScrollView *)x; }
     });
     return best;
+}
+// prefer the invite-friends screen (Rave.FriendsManagementViewController); the room chat list is bigger and would win otherwise
+static UIScrollView *RYBiggestList(void) {
+    UIViewController *vc = RYFindVC(CF(@"inviteClass", @"FriendsManagementViewController"));
+    UIScrollView *l = vc ? RYListIn(vc.view) : nil;
+    if (l) return l;
+    for (UIWindow *w in RYAppWindows()) { UIScrollView *x = RYListIn(w); if (x) return x; }
+    return nil;
 }
 static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv) {
     if ([sv isKindOfClass:UITableView.class]) return ((UITableView *)sv).visibleCells;
