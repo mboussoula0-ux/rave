@@ -15,7 +15,7 @@
 #define RY_CFG @"ry.cfg.v1"
 #define RY_ROOM_DEFAULT @"MeshContentViewController"
 #define RY_CHAT_DEFAULT @"MeshChatBarController"
-#define RY_BRAND_TOKENS @"rave,logo,wordmark"
+#define RY_BRAND_TOKENS @"rave,logo,wordmark,c7d7409e"
 
 static NSMutableDictionary *gCfg;
 
