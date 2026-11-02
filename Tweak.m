@@ -9,6 +9,13 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
+#import <AudioToolbox/AudioToolbox.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <math.h>
 
 #pragma mark - Config / storage
 
@@ -242,6 +249,99 @@ static void RYStopAll(void) { for (AVAudioPlayer *p in gPlayers) [p stop]; [gPla
 static NSArray<NSString *> *RYSoundFiles(void) {
     NSArray *all = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:RYDir(@"sounds") error:nil] ?: @[];
     return [all sortedArrayUsingSelector:@selector(compare:)];
+}
+
+#pragma mark - Mic booster (hooks AudioUnitRender on the mic bus used by WebRTC)
+
+static volatile BOOL gMicOn = NO;
+static volatile float gMicGain = 2.0f;
+
+static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
+
+static inline float RYSoft(float x) { // x in -1..1 range, soft knee above 0.6 so boosted peaks don't harsh-clip
+    float a = fabsf(x);
+    if (a <= 0.6f) return x;
+    float o = 0.6f + 0.4f * tanhf((a - 0.6f) / 0.4f);
+    return x < 0 ? -o : o;
+}
+static void RYApplyGain(AudioUnit u, AudioBufferList *io) {
+    static AudioUnit lastU = NULL; static BOOL isFloat = NO; static BOOL is16 = YES;
+    if (u != lastU) {
+        AudioStreamBasicDescription d; UInt32 sz = sizeof(d); memset(&d, 0, sizeof(d));
+        if (AudioUnitGetProperty(u, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &d, &sz) == noErr && d.mBitsPerChannel) {
+            isFloat = (d.mFormatFlags & kAudioFormatFlagIsFloat) != 0; is16 = d.mBitsPerChannel == 16;
+        } else { isFloat = NO; is16 = YES; }
+        lastU = u;
+    }
+    float g = gMicGain; if (g < 1.0f) g = 1.0f; if (g > 8.0f) g = 8.0f;
+    for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
+        void *p = io->mBuffers[b].mData; UInt32 bytes = io->mBuffers[b].mDataByteSize; if (!p || !bytes) continue;
+        if (isFloat) { float *f = p; UInt32 n = bytes / 4; for (UInt32 i = 0; i < n; i++) f[i] = RYSoft(f[i] * g); }
+        else if (is16) {
+            int16_t *s = p; UInt32 n = bytes / 2;
+            for (UInt32 i = 0; i < n; i++) { float x = RYSoft((s[i] / 32768.0f) * g); s[i] = (int16_t)(x * 32767.0f); }
+        }
+    }
+}
+static OSStatus ry_AudioUnitRender(AudioUnit u, AudioUnitRenderActionFlags *f, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
+    OSStatus r = orig_AudioUnitRender(u, f, ts, bus, frames, io);
+    if (r == noErr && bus == 1 && io && gMicOn) RYApplyGain(u, io);
+    return r;
+}
+
+// minimal fishhook (arm64): rebinds the lazy / non-lazy symbol pointers of every loaded image
+static void RYRebindSection(const struct section_64 *sec, intptr_t slide, struct nlist_64 *symtab, char *strtab, uint32_t *indirect, const char *name, void *repl, void **orig) {
+    BOOL isConst = strcmp(sec->segname, "__DATA_CONST") == 0;
+    uint32_t *idx = indirect + sec->reserved1;
+    void **bind = (void **)((uintptr_t)slide + sec->addr);
+    uintptr_t pg = (uintptr_t)bind & ~(uintptr_t)0x3FFF; size_t plen = (((uintptr_t)bind + sec->size) - pg + 0x3FFF) & ~(uintptr_t)0x3FFF;
+    if (isConst) mprotect((void *)pg, plen, PROT_READ | PROT_WRITE);
+    for (uint32_t i = 0; i < sec->size / sizeof(void *); i++) {
+        uint32_t si = idx[i];
+        if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL || si == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
+        char *sn = strtab + symtab[si].n_un.n_strx;
+        if (sn[0] && sn[1] && strcmp(sn + 1, name) == 0) {
+            if (orig && *orig == NULL && bind[i] != repl) *orig = bind[i];
+            bind[i] = repl;
+        }
+    }
+    if (isConst) mprotect((void *)pg, plen, PROT_READ);
+}
+static void RYAddImage(const struct mach_header *mh, intptr_t slide) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+    if (h->magic != MH_MAGIC_64) return;
+    const struct segment_command_64 *linkedit = NULL; const struct symtab_command *st = NULL; const struct dysymtab_command *dst = NULL;
+    uintptr_t cur = (uintptr_t)h + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cur;
+        if (lc->cmd == LC_SEGMENT_64) { const struct segment_command_64 *sg = (const void *)lc; if (strcmp(sg->segname, SEG_LINKEDIT) == 0) linkedit = sg; }
+        else if (lc->cmd == LC_SYMTAB) st = (const void *)lc;
+        else if (lc->cmd == LC_DYSYMTAB) dst = (const void *)lc;
+        cur += lc->cmdsize;
+    }
+    if (!linkedit || !st || !dst || !dst->nindirectsyms) return;
+    uintptr_t base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+    struct nlist_64 *symtab = (struct nlist_64 *)(base + st->symoff); char *strtab = (char *)(base + st->stroff);
+    uint32_t *indirect = (uint32_t *)(base + dst->indirectsymoff);
+    cur = (uintptr_t)h + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cur;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const void *)lc;
+            if (strcmp(sg->segname, "__DATA") == 0 || strcmp(sg->segname, "__DATA_CONST") == 0) {
+                const struct section_64 *sec = (const void *)(cur + sizeof(struct segment_command_64));
+                for (uint32_t j = 0; j < sg->nsects; j++) {
+                    uint32_t t = sec[j].flags & SECTION_TYPE;
+                    if (t == S_LAZY_SYMBOL_POINTERS || t == S_NON_LAZY_SYMBOL_POINTERS)
+                        RYRebindSection(&sec[j], slide, symtab, strtab, indirect, "AudioUnitRender", (void *)ry_AudioUnitRender, (void **)&orig_AudioUnitRender);
+                }
+            }
+        }
+        cur += lc->cmdsize;
+    }
+}
+static void RYSetMic(BOOL on, float gain) {
+    gMicOn = on; gMicGain = gain; CS(@"micOn", @(on)); CS(@"micGain", @(gain));
 }
 
 #pragma mark - Branding
@@ -656,7 +756,7 @@ static NSString *RYReport(void) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الأصوات", @"Sounds"), T(@"الإعدادات", @"Settings")];
+    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الأصوات", @"Sounds"), T(@"المايك", @"Mic"), T(@"الإعدادات", @"Settings")];
     NSMutableArray *tb = [NSMutableArray new];
     for (NSInteger i = 0; i < (NSInteger)names.count; i++) { [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
@@ -685,7 +785,7 @@ static NSString *RYReport(void) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 3: [self renderSounds]; break; default: [self renderSettings]; }
+    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 3: [self renderSounds]; break; case 4: [self renderMic]; break; default: [self renderSettings]; }
 }
 
 #pragma mark Locked
@@ -856,6 +956,21 @@ static NSString *RYReport(void) {
     [self rebuild];
 }
 
+#pragma mark Mic
+- (void)renderMic {
+    __weak typeof(self) ws = self;
+    [self.stack addArrangedSubview:RYLabel(T(@"يرفع صوت مايكك اللي ينرسل للغرفة (مو صوتك المحلي). ابدأ بـ 2x، ولو سمعوك مشوّش أو فيه خشخشة نزّله. فعّله قبل ما تفتح المايك في الغرفة، ولو ما اشتغل أعد فتح المايك.", @"Boosts the mic level sent to the room. Start at 2x and lower it if it distorts or gets noisy. Turn it on before you open the mic in a room; if it does nothing, toggle the mic again."), 13, UIFontWeightRegular, RY_MUTED)];
+    UISwitch *sw = [UISwitch new]; sw.on = gMicOn; sw.onTintColor = RYAccent(); __weak UISwitch *wsw = sw;
+    [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetMic(wsw.on, gMicGain); }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تفعيل مضخم المايك", @"Enable mic booster"), 15, UIFontWeightBold, nil), sw], 12)])];
+    [self.stack addArrangedSubview:RYSlider(T(@"مقدار التضخيم (1x - 5x)", @"Boost amount (1x - 5x)"), 1, 5, gMicGain, ^(float v) { RYSetMic(gMicOn, v); })];
+    NSMutableArray *ps = [NSMutableArray new];
+    for (NSNumber *g in @[@1.5, @2, @3, @4]) {
+        [ps addObject:RYBtn([NSString stringWithFormat:@"%gx", g.floatValue], gMicGain == g.floatValue, ^{ RYSetMic(gMicOn, g.floatValue); [ws rebuild]; })];
+    }
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"جاهز", @"Presets"), 15, UIFontWeightBold, nil), RYGrid(ps, 4)])];
+}
+
 #pragma mark Settings
 - (void)renderSettings {
     __weak typeof(self) ws = self;
@@ -922,7 +1037,8 @@ static NSString *RYReport(void) {
     NSData *j = [UIPasteboard.generalPasteboard.string dataUsingEncoding:NSUTF8StringEncoding];
     id o = j ? [NSJSONSerialization JSONObjectWithData:j options:0 error:nil] : nil;
     if (![o isKindOfClass:NSDictionary.class]) { [self toast:T(@"الحافظة ما فيها نسخة صالحة", @"Clipboard has no valid backup")]; return; }
-    for (NSString *k in @[@"lang", @"accent", @"autoOpen", @"bgMode", @"bgValue", @"blur", @"dim", @"vol", @"messages", @"brand", @"roomClass", @"bx", @"by"]) if (o[k]) CS(k, o[k]);
+    for (NSString *k in @[@"lang", @"accent", @"autoOpen", @"bgMode", @"bgValue", @"blur", @"dim", @"vol", @"messages", @"brand", @"roomClass", @"bx", @"by", @"micOn", @"micGain"]) if (o[k]) CS(k, o[k]);
+    gMicOn = [CF(@"micOn", @NO) boolValue]; gMicGain = [CF(@"micGain", @2.0) floatValue];
     if ([CF(@"bgMode", @"") isEqual:@"image"] && ![[NSFileManager defaultManager] fileExistsAtPath:[RYDir(nil) stringByAppendingPathComponent:@"bg.jpg"]]) CS(@"bgMode", @"none");
     [[RYCore shared] bump]; [self rebuild]; [self toast:T(@"تم الاستيراد", @"Imported")];
 }
@@ -1118,5 +1234,7 @@ static id RYInviteCtl(UIView *cell) {
 __attribute__((constructor)) static void RYInit(void) {
     if (![[NSBundle mainBundle].bundlePath.pathExtension isEqual:@"app"]) return; // skip app extensions
     RYLoad();
+    gMicOn = [CF(@"micOn", @NO) boolValue]; gMicGain = [CF(@"micGain", @2.0) floatValue];
+    _dyld_register_func_for_add_image(RYAddImage);
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { [[RYCore shared] start]; }];
 }
