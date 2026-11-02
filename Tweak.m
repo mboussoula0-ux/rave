@@ -255,7 +255,9 @@ static NSArray<NSString *> *RYSoundFiles(void) {
 
 static volatile BOOL gMicOn = NO;
 static volatile float gMicGain = 2.0f;
-static volatile BOOL gNoIso = YES; // turn off voice processing (noise suppression / AGC / echo cancel) on the mic unit
+static volatile BOOL gNoIso = NO;  // full bypass of voice processing (also removes echo cancel) - off by default
+static volatile BOOL gNoAGC = NO;  // only turn off the auto-gain / limiter that squashes loud speech
+static volatile BOOL gFmtFloat = NO, gFmt16 = YES; // mic stream format, learned from AudioUnitSetProperty (never queried on the audio thread)
 
 static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
 
@@ -265,16 +267,9 @@ static inline float RYSoft(float x) { // x in -1..1 range, soft knee above 0.6 s
     float o = 0.6f + 0.4f * tanhf((a - 0.6f) / 0.4f);
     return x < 0 ? -o : o;
 }
-static void RYApplyGain(AudioUnit u, AudioBufferList *io) {
-    static AudioUnit lastU = NULL; static BOOL isFloat = NO; static BOOL is16 = YES;
-    if (u != lastU) {
-        AudioStreamBasicDescription d; UInt32 sz = sizeof(d); memset(&d, 0, sizeof(d));
-        if (AudioUnitGetProperty(u, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &d, &sz) == noErr && d.mBitsPerChannel) {
-            isFloat = (d.mFormatFlags & kAudioFormatFlagIsFloat) != 0; is16 = d.mBitsPerChannel == 16;
-        } else { isFloat = NO; is16 = YES; }
-        lastU = u;
-    }
+static void RYApplyGain(AudioBufferList *io) {
     float g = gMicGain; if (g < 1.0f) g = 1.0f; if (g > 8.0f) g = 8.0f;
+    BOOL isFloat = gFmtFloat, is16 = gFmt16;
     for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
         void *p = io->mBuffers[b].mData; UInt32 bytes = io->mBuffers[b].mDataByteSize; if (!p || !bytes) continue;
         if (isFloat) { float *f = p; UInt32 n = bytes / 4; for (UInt32 i = 0; i < n; i++) f[i] = RYSoft(f[i] * g); }
@@ -286,17 +281,25 @@ static void RYApplyGain(AudioUnit u, AudioBufferList *io) {
 }
 static OSStatus ry_AudioUnitRender(AudioUnit u, AudioUnitRenderActionFlags *f, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
     OSStatus r = orig_AudioUnitRender(u, f, ts, bus, frames, io);
-    if (r == noErr && bus == 1 && io && gMicOn) RYApplyGain(u, io);
+    if (r == noErr && bus == 1 && io && gMicOn) RYApplyGain(io);
     return r;
 }
 
+static OSStatus (*orig_AudioUnitSetProperty)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void *, UInt32);
+static OSStatus ry_AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID pid, AudioUnitScope sc, AudioUnitElement el, const void *data, UInt32 sz) {
+    if (!orig_AudioUnitSetProperty) orig_AudioUnitSetProperty = dlsym(RTLD_DEFAULT, "AudioUnitSetProperty");
+    if (pid == kAudioUnitProperty_StreamFormat && sc == kAudioUnitScope_Output && el == 1 && data && sz >= sizeof(AudioStreamBasicDescription)) {
+        const AudioStreamBasicDescription *d = data;
+        if (d->mBitsPerChannel) { gFmtFloat = (d->mFormatFlags & kAudioFormatFlagIsFloat) != 0; gFmt16 = d->mBitsPerChannel == 16; }
+    }
+    return orig_AudioUnitSetProperty(u, pid, sc, el, data, sz);
+}
 static OSStatus (*orig_AudioUnitInitialize)(AudioUnit);
 static OSStatus ry_AudioUnitInitialize(AudioUnit u) {
-    if (gNoIso) {
-        UInt32 one = 1, zero = 0;
-        AudioUnitSetProperty(u, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &one, sizeof(one));
-        AudioUnitSetProperty(u, kAUVoiceIOProperty_VoiceProcessingEnableAGC, kAudioUnitScope_Global, 0, &zero, sizeof(zero));
-    }
+    if (!orig_AudioUnitInitialize) orig_AudioUnitInitialize = dlsym(RTLD_DEFAULT, "AudioUnitInitialize");
+    UInt32 one = 1, zero = 0;
+    if (gNoAGC) AudioUnitSetProperty(u, kAUVoiceIOProperty_VoiceProcessingEnableAGC, kAudioUnitScope_Global, 0, &zero, sizeof(zero));
+    if (gNoIso) AudioUnitSetProperty(u, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &one, sizeof(one));
     return orig_AudioUnitInitialize(u);
 }
 
@@ -321,6 +324,7 @@ static void RYRebindSection(const struct section_64 *sec, intptr_t slide, struct
 static void RYAddImage(const struct mach_header *mh, intptr_t slide) {
     const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
     if (h->magic != MH_MAGIC_64) return;
+    Dl_info di; if (dladdr(mh, &di) && di.dli_fname && (strncmp(di.dli_fname, "/System/", 8) == 0 || strncmp(di.dli_fname, "/usr/lib/", 9) == 0)) return;
     const struct segment_command_64 *linkedit = NULL; const struct symtab_command *st = NULL; const struct dysymtab_command *dst = NULL;
     uintptr_t cur = (uintptr_t)h + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < h->ncmds; i++) {
@@ -347,15 +351,23 @@ static void RYAddImage(const struct mach_header *mh, intptr_t slide) {
                         RYRebindSection(&sec[j], slide, symtab, strtab, indirect, "AudioUnitRender", (void *)ry_AudioUnitRender, (void **)&orig_AudioUnitRender);
                     if (t == S_LAZY_SYMBOL_POINTERS || t == S_NON_LAZY_SYMBOL_POINTERS)
                         RYRebindSection(&sec[j], slide, symtab, strtab, indirect, "AudioUnitInitialize", (void *)ry_AudioUnitInitialize, (void **)&orig_AudioUnitInitialize);
+                    if (t == S_LAZY_SYMBOL_POINTERS || t == S_NON_LAZY_SYMBOL_POINTERS)
+                        RYRebindSection(&sec[j], slide, symtab, strtab, indirect, "AudioUnitSetProperty", (void *)ry_AudioUnitSetProperty, (void **)&orig_AudioUnitSetProperty);
                 }
             }
         }
         cur += lc->cmdsize;
     }
 }
-static void RYSetNoIso(BOOL on) { gNoIso = on; CS(@"noIso", @(on)); }
+static BOOL gHooked = NO;
+static void RYInstallAudioHooks(void) { if (gHooked) return; gHooked = YES; _dyld_register_func_for_add_image(RYAddImage); }
+static void RYSetNoIso(BOOL on) { if (on) RYInstallAudioHooks(); gNoIso = on; CS(@"noIso", @(on)); }
+static void RYSetNoAGC(BOOL on) { if (on) RYInstallAudioHooks(); gNoAGC = on; CS(@"noAgc", @(on)); }
 static void RYSetMic(BOOL on, float gain) {
-    gMicOn = on; gMicGain = gain; CS(@"micOn", @(on)); CS(@"micGain", @(gain));
+    if (on) RYInstallAudioHooks();
+    gMicOn = on; gMicGain = gain;
+    static BOOL pending = NO; if (pending) return; pending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ pending = NO; CS(@"micOn", @(gMicOn)); CS(@"micGain", @(gMicGain)); });
 }
 
 #pragma mark - Branding
@@ -974,10 +986,14 @@ static NSString *RYReport(void) {
 - (void)renderMic {
     __weak typeof(self) ws = self;
     [self.stack addArrangedSubview:RYLabel(T(@"يرفع صوت مايكك اللي ينرسل للغرفة (مو صوتك المحلي). ابدأ بـ 2x، ولو سمعوك مشوّش أو فيه خشخشة نزّله. فعّله قبل ما تفتح المايك في الغرفة، ولو ما اشتغل أعد فتح المايك.", @"Boosts the mic level sent to the room. Start at 2x and lower it if it distorts or gets noisy. Turn it on before you open the mic in a room; if it does nothing, toggle the mic again."), 13, UIFontWeightRegular, RY_MUTED)];
+    UISwitch *agc = [UISwitch new]; agc.on = gNoAGC; agc.onTintColor = RYAccent(); __weak UISwitch *wagc = agc;
+    [agc addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetNoAGC(wagc.on); [ws toast:T(@"يتطبق عند إعادة فتح المايك", @"Applies when the mic restarts")]; }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"إيقاف التحكم التلقائي بالمستوى (AGC)", @"Disable auto gain (AGC)"), 15, UIFontWeightBold, nil), agc], 12),
+        RYLabel(T(@"يمنع تقليل صوتك لما ترفعه. آمن، ويبقى إلغاء الصدى شغّال.", @"Stops your voice being turned down when you get loud. Safe: echo cancellation stays on."), 12, UIFontWeightRegular, RY_MUTED)])];
     UISwitch *iso = [UISwitch new]; iso.on = gNoIso; iso.onTintColor = RYAccent(); __weak UISwitch *wiso = iso;
-    [iso addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetNoIso(wiso.on); [ws toast:T(@"أعد فتح المايك أو ادخل الغرفة من جديد", @"Toggle the mic or rejoin the room to apply")]; }] forControlEvents:UIControlEventValueChanged];
-    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"إيقاف العوازل (كتم الضوضاء / التحكم التلقائي)", @"Disable isolation (noise suppression / auto gain)"), 15, UIFontWeightBold, nil), iso], 12),
-        RYLabel(T(@"يوقف معالجة الصوت اللي تكتم الصوت العالي. بدون سماعة ممكن يرجع صدى. يتطبق عند فتح المايك من جديد.", @"Stops the processing that mutes loud speech. Without headphones echo may return. Applies when the mic restarts."), 12, UIFontWeightRegular, RY_MUTED)])];
+    [iso addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetNoIso(wiso.on); [ws toast:T(@"يتطبق عند إعادة فتح المايك", @"Applies when the mic restarts")]; }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"إيقاف كل معالجة الصوت (متقدم)", @"Disable all voice processing (advanced)"), 15, UIFontWeightBold, nil), iso], 12),
+        RYLabel(T(@"يوقف كتم الضوضاء وإلغاء الصدى كمان. ممكن تسمع صوتك راجع. استخدمه مع سماعة فقط.", @"Also removes noise suppression and echo cancellation. You may hear yourself. Headphones only."), 12, UIFontWeightRegular, RY_MUTED)])];
     UISwitch *sw = [UISwitch new]; sw.on = gMicOn; sw.onTintColor = RYAccent(); __weak UISwitch *wsw = sw;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetMic(wsw.on, gMicGain); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تفعيل مضخم المايك", @"Enable mic booster"), 15, UIFontWeightBold, nil), sw], 12)])];
@@ -1055,8 +1071,8 @@ static NSString *RYReport(void) {
     NSData *j = [UIPasteboard.generalPasteboard.string dataUsingEncoding:NSUTF8StringEncoding];
     id o = j ? [NSJSONSerialization JSONObjectWithData:j options:0 error:nil] : nil;
     if (![o isKindOfClass:NSDictionary.class]) { [self toast:T(@"الحافظة ما فيها نسخة صالحة", @"Clipboard has no valid backup")]; return; }
-    for (NSString *k in @[@"lang", @"accent", @"autoOpen", @"bgMode", @"bgValue", @"blur", @"dim", @"vol", @"messages", @"brand", @"roomClass", @"bx", @"by", @"micOn", @"micGain", @"noIso"]) if (o[k]) CS(k, o[k]);
-    gNoIso = [CF(@"noIso", @YES) boolValue];
+    for (NSString *k in @[@"lang", @"accent", @"autoOpen", @"bgMode", @"bgValue", @"blur", @"dim", @"vol", @"messages", @"brand", @"roomClass", @"bx", @"by", @"micOn", @"micGain", @"noIso", @"noAgc"]) if (o[k]) CS(k, o[k]);
+    gNoIso = [CF(@"noIso", @NO) boolValue]; gNoAGC = [CF(@"noAgc", @NO) boolValue];
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicGain = [CF(@"micGain", @2.0) floatValue];
     if ([CF(@"bgMode", @"") isEqual:@"image"] && ![[NSFileManager defaultManager] fileExistsAtPath:[RYDir(nil) stringByAppendingPathComponent:@"bg.jpg"]]) CS(@"bgMode", @"none");
     [[RYCore shared] bump]; [self rebuild]; [self toast:T(@"تم الاستيراد", @"Imported")];
@@ -1254,7 +1270,7 @@ __attribute__((constructor)) static void RYInit(void) {
     if (![[NSBundle mainBundle].bundlePath.pathExtension isEqual:@"app"]) return; // skip app extensions
     RYLoad();
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicGain = [CF(@"micGain", @2.0) floatValue];
-    gNoIso = [CF(@"noIso", @YES) boolValue];
-    _dyld_register_func_for_add_image(RYAddImage);
+    gNoIso = [CF(@"noIso", @NO) boolValue]; gNoAGC = [CF(@"noAgc", @NO) boolValue];
+    if (gMicOn || gNoIso || gNoAGC) RYInstallAudioHooks();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { [[RYCore shared] start]; }];
 }
