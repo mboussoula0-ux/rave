@@ -255,6 +255,7 @@ static NSArray<NSString *> *RYSoundFiles(void) {
 
 static volatile BOOL gMicOn = NO;
 static volatile float gMicGain = 2.0f;
+static volatile BOOL gNoIso = YES; // turn off voice processing (noise suppression / AGC / echo cancel) on the mic unit
 
 static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
 
@@ -287,6 +288,16 @@ static OSStatus ry_AudioUnitRender(AudioUnit u, AudioUnitRenderActionFlags *f, c
     OSStatus r = orig_AudioUnitRender(u, f, ts, bus, frames, io);
     if (r == noErr && bus == 1 && io && gMicOn) RYApplyGain(u, io);
     return r;
+}
+
+static OSStatus (*orig_AudioUnitInitialize)(AudioUnit);
+static OSStatus ry_AudioUnitInitialize(AudioUnit u) {
+    if (gNoIso) {
+        UInt32 one = 1, zero = 0;
+        AudioUnitSetProperty(u, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &one, sizeof(one));
+        AudioUnitSetProperty(u, kAUVoiceIOProperty_VoiceProcessingEnableAGC, kAudioUnitScope_Global, 0, &zero, sizeof(zero));
+    }
+    return orig_AudioUnitInitialize(u);
 }
 
 // minimal fishhook (arm64): rebinds the lazy / non-lazy symbol pointers of every loaded image
@@ -334,12 +345,15 @@ static void RYAddImage(const struct mach_header *mh, intptr_t slide) {
                     uint32_t t = sec[j].flags & SECTION_TYPE;
                     if (t == S_LAZY_SYMBOL_POINTERS || t == S_NON_LAZY_SYMBOL_POINTERS)
                         RYRebindSection(&sec[j], slide, symtab, strtab, indirect, "AudioUnitRender", (void *)ry_AudioUnitRender, (void **)&orig_AudioUnitRender);
+                    if (t == S_LAZY_SYMBOL_POINTERS || t == S_NON_LAZY_SYMBOL_POINTERS)
+                        RYRebindSection(&sec[j], slide, symtab, strtab, indirect, "AudioUnitInitialize", (void *)ry_AudioUnitInitialize, (void **)&orig_AudioUnitInitialize);
                 }
             }
         }
         cur += lc->cmdsize;
     }
 }
+static void RYSetNoIso(BOOL on) { gNoIso = on; CS(@"noIso", @(on)); }
 static void RYSetMic(BOOL on, float gain) {
     gMicOn = on; gMicGain = gain; CS(@"micOn", @(on)); CS(@"micGain", @(gain));
 }
@@ -960,6 +974,10 @@ static NSString *RYReport(void) {
 - (void)renderMic {
     __weak typeof(self) ws = self;
     [self.stack addArrangedSubview:RYLabel(T(@"يرفع صوت مايكك اللي ينرسل للغرفة (مو صوتك المحلي). ابدأ بـ 2x، ولو سمعوك مشوّش أو فيه خشخشة نزّله. فعّله قبل ما تفتح المايك في الغرفة، ولو ما اشتغل أعد فتح المايك.", @"Boosts the mic level sent to the room. Start at 2x and lower it if it distorts or gets noisy. Turn it on before you open the mic in a room; if it does nothing, toggle the mic again."), 13, UIFontWeightRegular, RY_MUTED)];
+    UISwitch *iso = [UISwitch new]; iso.on = gNoIso; iso.onTintColor = RYAccent(); __weak UISwitch *wiso = iso;
+    [iso addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetNoIso(wiso.on); [ws toast:T(@"أعد فتح المايك أو ادخل الغرفة من جديد", @"Toggle the mic or rejoin the room to apply")]; }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"إيقاف العوازل (كتم الضوضاء / التحكم التلقائي)", @"Disable isolation (noise suppression / auto gain)"), 15, UIFontWeightBold, nil), iso], 12),
+        RYLabel(T(@"يوقف معالجة الصوت اللي تكتم الصوت العالي. بدون سماعة ممكن يرجع صدى. يتطبق عند فتح المايك من جديد.", @"Stops the processing that mutes loud speech. Without headphones echo may return. Applies when the mic restarts."), 12, UIFontWeightRegular, RY_MUTED)])];
     UISwitch *sw = [UISwitch new]; sw.on = gMicOn; sw.onTintColor = RYAccent(); __weak UISwitch *wsw = sw;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetMic(wsw.on, gMicGain); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تفعيل مضخم المايك", @"Enable mic booster"), 15, UIFontWeightBold, nil), sw], 12)])];
@@ -1037,7 +1055,8 @@ static NSString *RYReport(void) {
     NSData *j = [UIPasteboard.generalPasteboard.string dataUsingEncoding:NSUTF8StringEncoding];
     id o = j ? [NSJSONSerialization JSONObjectWithData:j options:0 error:nil] : nil;
     if (![o isKindOfClass:NSDictionary.class]) { [self toast:T(@"الحافظة ما فيها نسخة صالحة", @"Clipboard has no valid backup")]; return; }
-    for (NSString *k in @[@"lang", @"accent", @"autoOpen", @"bgMode", @"bgValue", @"blur", @"dim", @"vol", @"messages", @"brand", @"roomClass", @"bx", @"by", @"micOn", @"micGain"]) if (o[k]) CS(k, o[k]);
+    for (NSString *k in @[@"lang", @"accent", @"autoOpen", @"bgMode", @"bgValue", @"blur", @"dim", @"vol", @"messages", @"brand", @"roomClass", @"bx", @"by", @"micOn", @"micGain", @"noIso"]) if (o[k]) CS(k, o[k]);
+    gNoIso = [CF(@"noIso", @YES) boolValue];
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicGain = [CF(@"micGain", @2.0) floatValue];
     if ([CF(@"bgMode", @"") isEqual:@"image"] && ![[NSFileManager defaultManager] fileExistsAtPath:[RYDir(nil) stringByAppendingPathComponent:@"bg.jpg"]]) CS(@"bgMode", @"none");
     [[RYCore shared] bump]; [self rebuild]; [self toast:T(@"تم الاستيراد", @"Imported")];
@@ -1235,6 +1254,7 @@ __attribute__((constructor)) static void RYInit(void) {
     if (![[NSBundle mainBundle].bundlePath.pathExtension isEqual:@"app"]) return; // skip app extensions
     RYLoad();
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicGain = [CF(@"micGain", @2.0) floatValue];
+    gNoIso = [CF(@"noIso", @YES) boolValue];
     _dyld_register_func_for_add_image(RYAddImage);
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { [[RYCore shared] start]; }];
 }
