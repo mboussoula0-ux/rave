@@ -1443,3 +1443,4 @@ __attribute__((constructor)) static void RYInit(void) {
     if (gMicOn || gNoIso || gNoAGC) RYInstallAudioHooks();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { [[RYCore shared] start]; }];
 }
+
