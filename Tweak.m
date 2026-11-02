@@ -10,6 +10,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <CoreLocation/CoreLocation.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -410,6 +411,61 @@ static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
     }] resume];
 }
 
+#pragma mark - Anti-AFK (keep the process alive in the background + ignore audio interruptions in Rave's own code)
+
+static BOOL gKeepOn = YES, gIgnoreInt = YES;
+
+@interface RYKeep : NSObject <CLLocationManagerDelegate>
+@property (nonatomic, strong) CLLocationManager *lm;
++ (instancetype)shared;
+- (void)start; - (void)stop;
+@end
+@implementation RYKeep
++ (instancetype)shared { static RYKeep *k; static dispatch_once_t o; dispatch_once(&o, ^{ k = [RYKeep new]; }); return k; }
+static BOOL RYHasBgMode(NSString *m) { return [[NSBundle.mainBundle objectForInfoDictionaryKey:@"UIBackgroundModes"] containsObject:m]; }
+- (void)start {
+    if (self.lm) { CLAuthorizationStatus a = self.lm.authorizationStatus; if (a == kCLAuthorizationStatusAuthorizedWhenInUse || a == kCLAuthorizationStatusAuthorizedAlways) [self.lm startUpdatingLocation]; return; }
+    CLLocationManager *m = [CLLocationManager new]; m.delegate = self;
+    m.desiredAccuracy = kCLLocationAccuracyThreeKilometers; m.distanceFilter = 3000; m.pausesLocationUpdatesAutomatically = NO;
+    if (RYHasBgMode(@"location")) { m.allowsBackgroundLocationUpdates = YES; m.showsBackgroundLocationIndicator = YES; } // setting this without the plist key would crash
+    self.lm = m;
+    if (m.authorizationStatus == kCLAuthorizationStatusNotDetermined) [m requestWhenInUseAuthorization];
+    else [m startUpdatingLocation];
+}
+- (void)stop { [self.lm stopUpdatingLocation]; self.lm = nil; }
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)m {
+    CLAuthorizationStatus a = m.authorizationStatus;
+    if (a == kCLAuthorizationStatusAuthorizedWhenInUse || a == kCLAuthorizationStatusAuthorizedAlways) [m startUpdatingLocation];
+}
+- (void)locationManager:(CLLocationManager *)m didUpdateLocations:(NSArray<CLLocation *> *)l {}
+- (void)locationManager:(CLLocationManager *)m didFailWithError:(NSError *)e {}
+@end
+static NSString *RYKeepStatus(void) {
+    if (!gKeepOn) return T(@"متوقف", @"Off");
+    if (!RYHasBgMode(@"location")) return T(@"ناقص: شغّل patch_ipa.py على الـ IPA (يضيف صلاحية الموقع بالخلفية)", @"Incomplete: run patch_ipa.py on the IPA (adds the background-location mode)");
+    CLAuthorizationStatus a = [CLLocationManager new].authorizationStatus;
+    if (a == kCLAuthorizationStatusDenied || a == kCLAuthorizationStatusRestricted) return T(@"الموقع مرفوض: فعّله من إعدادات iOS للتطبيق", @"Location denied: allow it in iOS Settings for the app");
+    if (a == kCLAuthorizationStatusNotDetermined) return T(@"بانتظار موافقتك على الموقع", @"Waiting for your location permission");
+    return T(@"شغّال", @"Running");
+}
+static void RYSetKeep(BOOL on) { gKeepOn = on; CS(@"keepOn", @(on)); if (on) [[RYKeep shared] start]; else [[RYKeep shared] stop]; }
+static void RYSetIgnoreInt(BOOL on) { gIgnoreInt = on; CS(@"ignoreInt", @(on)); }
+
+// Rave's own observers of AVAudioSession interruptions (phone calls etc.) are not registered, so the app can't react by leaving the room.
+// WebRTC's own observers (RTC*) are untouched. Takes effect the next time the app starts.
+static IMP orig_addObserver;
+static void ry_addObserver(id self, SEL _cmd, id obs, SEL sel, NSNotificationName name, id obj) {
+    if (name && obs && [name isEqualToString:AVAudioSessionInterruptionNotification]) {
+        NSString *cn = NSStringFromClass([obs class]);
+        if ([cn hasPrefix:@"Rave."] || [cn hasPrefix:@"_TtC4Rave"]) return;
+    }
+    ((void (*)(id, SEL, id, SEL, NSNotificationName, id))orig_addObserver)(self, _cmd, obs, sel, name, obj);
+}
+static void RYInstallInterruptFilter(void) {
+    Method m = class_getInstanceMethod(NSNotificationCenter.class, @selector(addObserver:selector:name:object:));
+    if (m && !orig_addObserver) { orig_addObserver = method_getImplementation(m); method_setImplementation(m, (IMP)ry_addObserver); }
+}
+
 #pragma mark - Branding
 
 static NSString *RYBrand(void) {
@@ -783,6 +839,41 @@ static NSString *RYReport(void) {
 
 #pragma mark - Panel
 
+#pragma mark - Quick-message loop (sends the saved messages one after another until switched off)
+
+static BOOL gMsgLoop = NO; static NSUInteger gMsgIdx = 0, gMsgFails = 0, gMsgSent = 0; static NSInteger gMsgGen = 0;
+static UIBackgroundTaskIdentifier gBGTask = UIBackgroundTaskInvalid;
+static void RYBGRenew(BOOL on) { // keeps the process running a bit longer after leaving the app; renewed every message
+    UIApplication *app = UIApplication.sharedApplication;
+    UIBackgroundTaskIdentifier old = gBGTask; gBGTask = UIBackgroundTaskInvalid;
+    if (on) gBGTask = [app beginBackgroundTaskWithName:@"layan.loop" expirationHandler:^{
+        UIBackgroundTaskIdentifier t = gBGTask; gBGTask = UIBackgroundTaskInvalid; if (t != UIBackgroundTaskInvalid) [app endBackgroundTask:t];
+    }];
+    if (old != UIBackgroundTaskInvalid) [app endBackgroundTask:old];
+}
+static void RYMsgLoopStep(NSInteger gen) {
+    if (!gMsgLoop || gen != gMsgGen) return;
+    RYBGRenew(YES);
+    NSArray *msgs = CF(@"messages", @[]);
+    if (!msgs.count) { gMsgLoop = NO; RYBGRenew(NO); return; }
+    if (gMsgIdx >= msgs.count) gMsgIdx = 0;
+    NSString *m = msgs[gMsgIdx++];
+    double delay = MAX(2.0, [CF(@"msgDelay", @4.0) doubleValue]); // never faster than every 2 seconds
+    [[RYCore shared] sendMessage:m done:^(NSInteger code) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!gMsgLoop || gen != gMsgGen) return;
+            if (code == 0) { gMsgSent++; gMsgFails = 0; }
+            else if (++gMsgFails >= 3) { gMsgLoop = NO; RYBGRenew(NO); return; } // chat input not available (left the room?) -> stop
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ RYMsgLoopStep(gen); });
+        });
+    }];
+}
+static void RYMsgLoopSet(BOOL on) {
+    gMsgLoop = on; gMsgGen++; gMsgFails = 0; gMsgSent = 0;
+    if (!on) RYBGRenew(NO);
+    if (on) { gMsgIdx = 0; RYMsgLoopStep(gMsgGen); }
+}
+
 @interface RYPanel : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate, UIColorPickerViewControllerDelegate>
 @property (nonatomic) NSInteger tab;
 @property (nonatomic, strong) UIStackView *stack;
@@ -964,6 +1055,19 @@ static NSString *RYReport(void) {
 - (void)renderMsgs {
     __weak typeof(self) ws = self;
     NSArray *msgs = CF(@"messages", @[@"👋", @"😂", @"🔥", @"ثواني وأرجع"]);
+    UISwitch *lp = [UISwitch new]; lp.on = gMsgLoop; lp.onTintColor = RYAccent(); __weak UISwitch *wlp = lp;
+    UILabel *lst = RYLabel(@"", 12, UIFontWeightRegular, RY_MUTED); self.invLabel = lst;
+    [lp addAction:[UIAction actionWithHandler:^(UIAction *a) {
+        if (wlp.on && ![CF(@"messages", @[]) count]) { wlp.on = NO; [ws toast:T(@"أضف رسالة أول", @"Add a message first")]; return; }
+        RYMsgLoopSet(wlp.on);
+    }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"إرسال كل الرسائل بتكرار", @"Loop all messages"), 15, UIFontWeightBold, nil), lp], 12),
+        RYLabel(T(@"يرسل رسائلك وحدة بعد وحدة لين تطفي الزر. يكمّل حتى لو طلعت من التطبيق طالما أنت داخل الروم، ويوقف لحاله لو طلعت من الروم. الغرف ممكن تكتمك لو كثّرت.", @"Sends your messages one after another until switched off. Keeps going when you leave the app as long as you stay in the room; stops if you leave the room. Rooms may mute you for flooding."), 12, UIFontWeightRegular, RY_MUTED), lst])];
+    [self.stack addArrangedSubview:RYSlider(T(@"الفاصل بين الرسائل (ثواني)", @"Delay between messages (seconds)"), 2, 15, [CF(@"msgDelay", @4.0) floatValue], ^(float v) { CS(@"msgDelay", @(v)); })];
+    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        ws.invLabel.text = gMsgLoop ? [NSString stringWithFormat:T(@"شغّال... انرسل %lu", @"Running... sent %lu"), (unsigned long)gMsgSent] : T(@"متوقف", @"Stopped");
+        if (!gMsgLoop && wlp.on) wlp.on = NO;
+    }];
     [self.stack addArrangedSubview:RYLabel(T(@"اضغط على الرسالة لإرسالها مرة وحدة للدردشة.", @"Tap a message to send it once to the room chat."), 13, UIFontWeightRegular, RY_MUTED)];
     for (NSUInteger i = 0; i < msgs.count; i++) {
         NSString *m = msgs[i];
@@ -1330,6 +1434,10 @@ static id RYInviteCtl(UIView *cell) {
 __attribute__((constructor)) static void RYInit(void) {
     if (![[NSBundle mainBundle].bundlePath.pathExtension isEqual:@"app"]) return; // skip app extensions
     RYLoad();
+    gKeepOn = YES; gIgnoreInt = YES; // Anti-AFK is always on: no switch, not stored, not importable
+    RYInstallInterruptFilter();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [[RYKeep shared] start]; });
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { [[RYKeep shared] start]; }]; // re-arm if location was just allowed
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicGain = [CF(@"micGain", @2.0) floatValue];
     gNoIso = [CF(@"noIso", @NO) boolValue]; gNoAGC = [CF(@"noAgc", @NO) boolValue];
     if (gMicOn || gNoIso || gNoAGC) RYInstallAudioHooks();
