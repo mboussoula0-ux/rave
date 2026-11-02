@@ -5,7 +5,7 @@ include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = RaveRayane
 RaveRayane_FILES = Tweak.m
-RaveRayane_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-format-security
+RaveRayane_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-format-security -Wno-unused-function -Wno-error
 RaveRayane_FRAMEWORKS = UIKit Foundation AVFoundation PhotosUI ImageIO UniformTypeIdentifiers
 RaveRayane_INSTALL_PATH = @rpath
 
