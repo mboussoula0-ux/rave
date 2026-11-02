@@ -761,7 +761,7 @@ static NSString *RYReport(void) {
     for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
         if (rows >= 4 || o.length > 22000 || x.hidden || !x.window) return;
         if (![x isKindOfClass:UICollectionView.class] && ![x isKindOfClass:UITableView.class]) return;
-        NSArray *cells = [x isKindOfClass:UITableView.class] ? ((UITableView *)x).visibleCells : ((UICollectionView *)x).visibleCells;
+        NSArray *cells = [x isKindOfClass:UITableView.class] ? (NSArray *)((UITableView *)x).visibleCells : (NSArray *)((UICollectionView *)x).visibleCells;
         for (UIView *c in cells) {
             if (rows >= 4) break; rows++;
             NSMutableString *t = [NSMutableString new]; RYWalk(c, 0, ^(UIView *y, int dd) { if ([y isKindOfClass:UILabel.class] && ((UILabel *)y).text.length) [t appendFormat:@"%@ ; ", RYClip(((UILabel *)y).text, 20)]; });
@@ -842,7 +842,7 @@ static NSString *RYReport(void) {
 #pragma mark - Quick-message loop (sends the saved messages one after another until switched off)
 
 static BOOL gMsgLoop = NO; static NSUInteger gMsgIdx = 0, gMsgFails = 0, gMsgSent = 0; static NSInteger gMsgGen = 0;
-static UIBackgroundTaskIdentifier gBGTask = UIBackgroundTaskInvalid;
+static UIBackgroundTaskIdentifier gBGTask = 0; // 0 == UIBackgroundTaskInvalid (the constant itself is not a compile-time value)
 static void RYBGRenew(BOOL on) { // keeps the process running a bit longer after leaving the app; renewed every message
     UIApplication *app = UIApplication.sharedApplication;
     UIBackgroundTaskIdentifier old = gBGTask; gBGTask = UIBackgroundTaskInvalid;
@@ -1443,4 +1443,3 @@ __attribute__((constructor)) static void RYInit(void) {
     if (gMicOn || gNoIso || gNoAGC) RYInstallAudioHooks();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { [[RYCore shared] start]; }];
 }
-
