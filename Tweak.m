@@ -370,6 +370,46 @@ static void RYSetMic(BOOL on, float gain) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ pending = NO; CS(@"micOn", @(gMicOn)); CS(@"micGain", @(gMicGain)); });
 }
 
+#pragma mark - Join room by link (sideloaded builds lose Universal Links, so we hand the URL to the app ourselves)
+
+static NSURL *RYParseRoomURL(NSString *s) {
+    s = [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!s.length) return nil;
+    NSDataDetector *dd = [NSDataDetector dataDetectorWithTypes:NSTextCheckingTypeLink error:nil];
+    NSTextCheckingResult *m = [dd firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+    NSURL *u = m.URL;
+    if (!u) u = [NSURL URLWithString:[@"https://" stringByAppendingString:s]];
+    if (!u.host.length) return nil;
+    NSURLComponents *c = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO];
+    if ([c.scheme isEqualToString:@"http"]) c.scheme = @"https";
+    return c.URL ?: u;
+}
+// calls the same entry points iOS would call for a tapped Universal Link
+static BOOL RYDeliverURL(NSURL *u) {
+    UIApplication *app = UIApplication.sharedApplication;
+    NSUserActivity *act = [[NSUserActivity alloc] initWithActivityType:NSUserActivityTypeBrowsingWeb];
+    act.webpageURL = u;
+    BOOL handled = NO;
+    for (UIScene *sc in app.connectedScenes) {
+        id d = sc.delegate;
+        if ([d respondsToSelector:@selector(scene:continueUserActivity:)]) { [d scene:sc continueUserActivity:act]; handled = YES; }
+    }
+    id ad = app.delegate;
+    if (!handled && [ad respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)])
+        handled = [ad application:app continueUserActivity:act restorationHandler:^(NSArray<id<UIUserActivityRestoring>> *x) {}];
+    if (!handled && [ad respondsToSelector:@selector(application:openURL:options:)])
+        handled = [ad application:app openURL:u options:@{}];
+    return handled;
+}
+static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
+    if (RYDeliverURL(u)) { done(YES); return; }
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 8;
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        NSURL *f = resp.URL;
+        dispatch_async(dispatch_get_main_queue(), ^{ done((f && ![f isEqual:u]) ? RYDeliverURL(f) : NO); });
+    }] resume];
+}
+
 #pragma mark - Branding
 
 static NSString *RYBrand(void) {
@@ -782,7 +822,7 @@ static NSString *RYReport(void) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الأصوات", @"Sounds"), T(@"المايك", @"Mic"), T(@"الإعدادات", @"Settings")];
+    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الأصوات", @"Sounds"), T(@"المايك", @"Mic"), T(@"دخول برابط", @"Join link"), T(@"الإعدادات", @"Settings")];
     NSMutableArray *tb = [NSMutableArray new];
     for (NSInteger i = 0; i < (NSInteger)names.count; i++) { [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
@@ -811,7 +851,7 @@ static NSString *RYReport(void) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 3: [self renderSounds]; break; case 4: [self renderMic]; break; default: [self renderSettings]; }
+    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 3: [self renderSounds]; break; case 4: [self renderMic]; break; case 5: [self renderJoin]; break; default: [self renderSettings]; }
 }
 
 #pragma mark Locked
@@ -980,6 +1020,27 @@ static NSString *RYReport(void) {
         if (e) [self toast:T(@"تعذر النسخ", @"Copy failed")];
     }
     [self rebuild];
+}
+
+#pragma mark Join link
+- (void)joinFrom:(NSString *)str {
+    __weak typeof(self) ws = self;
+    NSURL *u = RYParseRoomURL(str);
+    if (!u) { [self toast:T(@"ما لقيت رابط", @"No link found")]; return; }
+    [self toast:T(@"جاري الدخول...", @"Joining...")];
+    RYJoinLink(u, ^(BOOL ok) {
+        if (!ok) { [ws toast:T(@"التطبيق ما تعرّف على الرابط", @"The app didn't recognise the link")]; return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
+    });
+}
+- (void)renderJoin {
+    __weak typeof(self) ws = self;
+    [self.stack addArrangedSubview:RYLabel(T(@"في النسخة المعدّلة الروابط ما تفتح التطبيق لما تضغط عليها (بسبب التوقيع). انسخ رابط الروم وادخل من هنا.", @"In the modded build tapped links don't open the app (signing drops Universal Links). Copy the room link and join from here."), 13, UIFontWeightRegular, RY_MUTED)];
+    UIButton *paste = RYBtn(T(@"لصق من الحافظة ودخول", @"Paste & join"), YES, ^{ [ws joinFrom:UIPasteboard.generalPasteboard.string]; });
+    UIButton *type = RYBtn(T(@"كتابة الرابط", @"Type link"), NO, ^{
+        [ws ask:T(@"رابط الروم", @"Room link") ph:@"rave.link/..." secure:NO ok:^(NSString *x) { [ws joinFrom:x]; }];
+    });
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"دخول روم برابط", @"Join a room by link"), 15, UIFontWeightBold, nil), RYHStack(@[paste, type], 8)])];
 }
 
 #pragma mark Mic
