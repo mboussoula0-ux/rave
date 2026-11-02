@@ -173,11 +173,6 @@ static void RYDump(UIViewController *vc, int d, NSMutableString *o) {
     for (UIViewController *c in vc.childViewControllers) RYDump(c, d + 1, o);
     RYDump(vc.presentedViewController, d + 1, o);
 }
-static UIView *RYFindFirst(UIView *v, BOOL (^pred)(UIView *)) {
-    if (pred(v)) return v;
-    for (UIView *s in v.subviews) { UIView *r = RYFindFirst(s, pred); if (r) return r; }
-    return nil;
-}
 
 #pragma mark - Sounds
 
