@@ -15,6 +15,7 @@
 #define RY_CFG @"ry.cfg.v1"
 #define RY_ROOM_DEFAULT @"MeshContentViewController"
 #define RY_CHAT_DEFAULT @"MeshChatBarController"
+#define RY_BRAND_TOKENS @"rave,logo,wordmark"
 
 static NSMutableDictionary *gCfg;
 
@@ -231,28 +232,65 @@ static NSArray<NSString *> *RYSoundFiles(void) {
 
 #pragma mark - Branding
 
-static const void *kBrandLbl = &kBrandLbl;
+static NSString *RYBrand(void) {
+    NSString *s = CF(@"brandName", @"Layan");
+    return ([s isKindOfClass:NSString.class] && s.length) ? s : @"Layan";
+}
 static NSString *RYImgName(UIImage *im) {
     if (!im) return @"";
     @try { NSString *n = [im.imageAsset valueForKey:@"assetName"]; return n ?: @""; } @catch (__unused id e) { return @""; }
 }
+static BOOL RYInCell(UIView *v) {
+    for (UIView *p = v; p; p = p.superview) if ([p isKindOfClass:UITableViewCell.class] || [p isKindOfClass:UICollectionViewCell.class]) return YES;
+    return NO;
+}
+static NSString *const kRaveRx = @"\\brave\\b";
+// returns the replaced text, or nil when there is nothing to replace
+static NSString *RYRepl(NSString *s) {
+    if (![s isKindOfClass:NSString.class] || !s.length || s.length > 40) return nil;
+    if ([s rangeOfString:RYBrand() options:NSCaseInsensitiveSearch].location != NSNotFound) return nil;
+    if ([s rangeOfString:kRaveRx options:NSRegularExpressionSearch | NSCaseInsensitiveSearch].location == NSNotFound) return nil;
+    return [s stringByReplacingOccurrencesOfString:kRaveRx withString:[NSRegularExpression escapedTemplateForString:RYBrand()]
+                                           options:NSRegularExpressionSearch | NSCaseInsensitiveSearch range:NSMakeRange(0, s.length)];
+}
+static UIImage *RYTextImage(NSString *t, CGSize sz, UIColor *c) {
+    CGFloat fs = MAX(10, sz.height * 0.8); NSDictionary *a = nil; CGSize ts = CGSizeZero;
+    for (int k = 0; k < 14; k++) {
+        a = @{NSFontAttributeName: [UIFont systemFontOfSize:fs weight:UIFontWeightHeavy], NSForegroundColorAttributeName: c};
+        ts = [t sizeWithAttributes:a];
+        if (ts.width <= sz.width && ts.height <= sz.height) break;
+        fs *= 0.85;
+    }
+    NSDictionary *fa = a; CGSize fts = ts;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *x) {
+        [t drawAtPoint:CGPointMake((sz.width - fts.width) / 2, (sz.height - fts.height) / 2) withAttributes:fa];
+    }];
+}
 static void RYBrandWalk(UIView *v, NSArray *toks) {
     if ([v isKindOfClass:UIImageView.class]) {
-        UIImageView *iv = (UIImageView *)v;
-        if (iv.window && iv.superview && !objc_getAssociatedObject(iv, kBrandLbl)) {
-            NSString *n = [RYImgName(iv.image) lowercaseString], *i = [iv.accessibilityIdentifier lowercaseString] ?: @"";
-            BOOL hit = NO; for (NSString *t in toks) if ([n containsString:t] || [i containsString:t]) { hit = YES; break; }
+        UIImageView *iv = (UIImageView *)v; CGSize s = iv.bounds.size;
+        if (iv.image && iv.window && !iv.hidden && s.width > 24 && s.height > 8 && s.height <= 140 && s.width / s.height >= 1.3 && !RYInCell(iv)) {
+            NSString *n = [RYImgName(iv.image) lowercaseString], *i = [iv.accessibilityIdentifier lowercaseString] ?: @"", *a = [iv.accessibilityLabel lowercaseString] ?: @"";
+            BOOL hit = NO; for (NSString *t in toks) if ([n containsString:t] || [i containsString:t] || [a containsString:t]) { hit = YES; break; }
             if (hit) {
-                UILabel *l = [UILabel new]; l.text = @"Rayane"; l.textColor = UIColor.whiteColor;
-                l.font = [UIFont systemFontOfSize:MAX(14, MIN(28, iv.bounds.size.height * 0.6)) weight:UIFontWeightHeavy];
-                l.translatesAutoresizingMaskIntoConstraints = NO; [iv.superview addSubview:l];
-                [NSLayoutConstraint activateConstraints:@[[l.centerXAnchor constraintEqualToAnchor:iv.centerXAnchor], [l.centerYAnchor constraintEqualToAnchor:iv.centerYAnchor]]];
-                iv.alpha = 0; objc_setAssociatedObject(iv, kBrandLbl, l, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                UIColor *c = iv.traitCollection.userInterfaceStyle == UIUserInterfaceStyleLight ? UIColor.blackColor : UIColor.whiteColor;
+                iv.image = RYTextImage(RYBrand(), s, c); iv.contentMode = UIViewContentModeScaleAspectFit;
             }
         }
     } else if ([v isKindOfClass:UILabel.class]) {
-        UILabel *l = (UILabel *)v;
-        if ([[l.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] caseInsensitiveCompare:@"rave"] == NSOrderedSame) l.text = @"Rayane";
+        UILabel *l = (UILabel *)v; NSAttributedString *at = l.attributedText;
+        if (at.length && at.length <= 40 && !RYInCell(l) && RYRepl(at.string)) {
+            NSMutableAttributedString *m = [at mutableCopy];
+            [m.mutableString replaceOccurrencesOfString:kRaveRx withString:[NSRegularExpression escapedTemplateForString:RYBrand()]
+                                                options:NSRegularExpressionSearch | NSCaseInsensitiveSearch range:NSMakeRange(0, m.length)];
+            l.attributedText = m;
+        }
+    } else if ([v isKindOfClass:UIButton.class] && !RYInCell(v)) {
+        UIButton *b = (UIButton *)v;
+        NSString *n = RYRepl([b titleForState:UIControlStateNormal]); if (n) [b setTitle:n forState:UIControlStateNormal];
+        UIButtonConfiguration *cfg = b.configuration; NSString *cn = RYRepl(cfg.title);
+        if (cn) { cfg.title = cn; b.configuration = cfg; }
     }
     for (UIView *s in v.subviews) RYBrandWalk(s, toks);
 }
@@ -307,6 +345,169 @@ static NSString *RYImageReport(void) {
 }
 @end
 
+#pragma mark - Room helpers (see-through views, chat input, diagnostics)
+
+static NSMapTable *gOrigBG;
+static BOOL RYSkipClass(UIView *v) {
+    NSString *c = NSStringFromClass(v.class), *l = NSStringFromClass(v.layer.class);
+    for (NSString *k in @[@"Video", @"Player", @"Metal", @"MTK", @"Camera", @"Preview", @"Flutter", @"WK", @"WebView", @"SampleBuffer"])
+        if ([c containsString:k] || [l containsString:k]) return YES;
+    return NO;
+}
+static void RYClear(UIView *v) {
+    if (!gOrigBG) gOrigBG = [NSMapTable weakToStrongObjectsMapTable];
+    if (![gOrigBG objectForKey:v]) [gOrigBG setObject:(v.backgroundColor ?: (id)NSNull.null) forKey:v];
+    v.backgroundColor = UIColor.clearColor;
+}
+static void RYRestoreAll(void) {
+    for (UIView *v in [gOrigBG.keyEnumerator allObjects]) {
+        id o = [gOrigBG objectForKey:v]; v.backgroundColor = [o isKindOfClass:UIColor.class] ? o : nil;
+    }
+    [gOrigBG removeAllObjects];
+}
+static BOOL RYHasBG(UIView *v) { return v.backgroundColor && CGColorGetAlpha(v.backgroundColor.CGColor) > 0.05; }
+// highest full-screen container above the room view (the room VC's own view can be only a small part of the screen)
+static UIView *RYFullHost(UIView *v) {
+    UIWindow *w = v.window; if (!w) return v;
+    UIView *best = v;
+    for (UIView *p = v.superview; p && p != w; p = p.superview) {
+        CGSize s = [p convertRect:p.bounds toView:w].size;
+        if (s.width >= w.bounds.size.width * 0.9 && s.height >= w.bounds.size.height * 0.8) best = p;
+    }
+    return best;
+}
+static void RYClearBig(UIView *v, UIView *host, UIView *skip, int d) {
+    if (d > 10) return;
+    for (UIView *s in v.subviews) {
+        if (s == skip || RYSkipClass(s)) continue;
+        if (RYHasBG(s) && ![s isKindOfClass:UIImageView.class]) {
+            CGRect f = [s convertRect:s.bounds toView:host];
+            if (f.size.width >= host.bounds.size.width * 0.85 && f.size.height >= host.bounds.size.height * 0.4) RYClear(s);
+        }
+        RYClearBig(s, host, skip, d + 1);
+    }
+}
+
+static void RYCollectInputs(UIView *v, NSMutableArray *o, int d) {
+    if (d > 40) return;
+    BOOL tf = [v isKindOfClass:UITextField.class] && !((UITextField *)v).secureTextEntry;
+    BOOL tv = [v isKindOfClass:UITextView.class] && ((UITextView *)v).isEditable;
+    if ((tf || tv) && !v.hidden && v.alpha > 0.01 && v.window && v.userInteractionEnabled) [o addObject:v];
+    for (UIView *s in v.subviews) RYCollectInputs(s, o, d + 1);
+}
+// chat bars sit at the bottom: pick the lowest visible input
+static UIView *RYBottomInput(UIView *root) {
+    NSMutableArray *c = [NSMutableArray new]; RYCollectInputs(root, c, 0);
+    UIView *best = nil; CGFloat by = -1e9;
+    for (UIView *x in c) { CGFloat y = CGRectGetMaxY([x convertRect:x.bounds toView:nil]); if (y > by) { by = y; best = x; } }
+    return best;
+}
+static NSString *RYGetText(UIView *in) { return [in isKindOfClass:UITextField.class] ? ((UITextField *)in).text : ((UITextView *)in).text; }
+static void RYSetText(UIView *in, NSString *msg) {
+    if ([in isKindOfClass:UITextField.class]) {
+        UITextField *tf = (UITextField *)in; tf.text = msg;
+        [tf sendActionsForControlEvents:UIControlEventEditingChanged];
+        [NSNotificationCenter.defaultCenter postNotificationName:UITextFieldTextDidChangeNotification object:tf];
+    } else {
+        UITextView *tv = (UITextView *)in; tv.text = msg;
+        if ([tv.delegate respondsToSelector:@selector(textViewDidChange:)]) [tv.delegate textViewDidChange:tv];
+        [NSNotificationCenter.defaultCenter postNotificationName:UITextViewTextDidChangeNotification object:tv];
+    }
+}
+static void RYPressReturn(UIView *in) {
+    if ([in isKindOfClass:UITextField.class]) {
+        UITextField *tf = (UITextField *)in;
+        if ([tf.delegate respondsToSelector:@selector(textFieldShouldReturn:)]) [tf.delegate textFieldShouldReturn:tf];
+        [tf sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+        [tf sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
+    } else {
+        UITextView *tv = (UITextView *)in;
+        if ([tv.delegate respondsToSelector:@selector(textView:shouldChangeTextInRange:replacementText:)])
+            [tv.delegate textView:tv shouldChangeTextInRange:NSMakeRange(tv.text.length, 0) replacementText:@"\n"];
+    }
+}
+static void RYCollectCtl(UIView *v, NSMutableArray *o, int d) {
+    if (d > 8) return;
+    if ([v isKindOfClass:UIControl.class] && !v.hidden && v.alpha > 0.01 && ((UIControl *)v).enabled && v.window) [o addObject:v];
+    for (UIView *s in v.subviews) RYCollectCtl(s, o, d + 1);
+}
+static NSString *RYCtlKey(UIControl *b) {
+    NSMutableString *k = [NSMutableString new];
+    [k appendFormat:@"%@|%@|", b.accessibilityLabel ?: @"", b.accessibilityIdentifier ?: @""];
+    if ([b isKindOfClass:UIButton.class]) {
+        UIButton *ub = (UIButton *)b;
+        [k appendFormat:@"%@|%@|%@", [ub titleForState:UIControlStateNormal] ?: @"", ub.configuration.title ?: @"", RYImgName([ub imageForState:UIControlStateNormal])];
+    }
+    return k.lowercaseString;
+}
+static UIControl *RYSendBtnNear(UIView *in) {
+    NSArray *good = @[@"send", @"إرسال", @"ارسال", @"submit", @"paperplane", @"paper_plane", @"arrow.up", @"arrow_up"];
+    NSArray *bad = @[@"sticker", @"emoji", @"gif", @"mic", @"voice", @"camera", @"attach", @"photo", @"gift"];
+    UIView *p = in;
+    for (int i = 0; i < 6 && p.superview; i++) {
+        p = p.superview;
+        NSMutableArray *c = [NSMutableArray new]; RYCollectCtl(p, c, 0);
+        for (UIControl *b in c) {
+            if ((UIView *)b == in || [b isKindOfClass:UITextField.class]) continue;
+            NSString *k = RYCtlKey(b); BOOL skip = NO;
+            for (NSString *w in bad) if ([k containsString:w]) { skip = YES; break; }
+            if (skip) continue;
+            for (NSString *w in good) if ([k containsString:w]) return b;
+        }
+        if (p.bounds.size.height > 400) break;
+    }
+    return nil;
+}
+
+static void RYWalk(UIView *v, int d, void (^blk)(UIView *, int)) { blk(v, d); for (UIView *s in v.subviews) RYWalk(s, d + 1, blk); }
+static NSString *RYClip(NSString *s, NSUInteger n) {
+    if (!s.length) return @"";
+    s = [s stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    return s.length > n ? [s substringToIndex:n] : s;
+}
+static NSString *RYReport(void) {
+    NSMutableString *o = [NSMutableString new];
+    NSDictionary *inf = NSBundle.mainBundle.infoDictionary;
+    [o appendFormat:@"app %@ (%@) | iOS %@ | %@\n", inf[@"CFBundleShortVersionString"], inf[@"CFBundleVersion"], UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
+    UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT)), *chat = RYFindVC(CF(@"chatClass", RY_CHAT_DEFAULT));
+    [o appendFormat:@"room: %@\nchat: %@\n", room ? NSStringFromClass(room.class) : @"NOT FOUND", chat ? NSStringFromClass(chat.class) : @"not found"];
+    __block BOOL flutter = NO;
+    for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) { if ([NSStringFromClass(x.class) containsString:@"Flutter"]) flutter = YES; });
+    [o appendFormat:@"flutter views: %@\n\n-- screens --\n", flutter ? @"yes" : @"no"];
+    for (UIWindow *w in RYAppWindows()) RYDump(w.rootViewController, 0, o);
+    UIView *host = room ? RYFullHost(room.view) : nil;
+    if (host) {
+        [o appendFormat:@"\n-- host %@ %.0fx%.0f | room view %.0fx%.0f --\n", NSStringFromClass(host.class), host.bounds.size.width, host.bounds.size.height, room.view.bounds.size.width, room.view.bounds.size.height];
+        RYWalk(host, 0, ^(UIView *x, int d) {
+            if (o.length > 8000) return;
+            CGRect f = [x convertRect:x.bounds toView:host];
+            if (f.size.width >= host.bounds.size.width * 0.8 && f.size.height >= host.bounds.size.height * 0.4) {
+                CGFloat a = x.backgroundColor ? CGColorGetAlpha(x.backgroundColor.CGColor) : 0;
+                [o appendFormat:@"%@%@ %.0fx%.0f bg=%.2f%@\n", [@"" stringByPaddingToLength:d * 2 withString:@" " startingAtIndex:0], NSStringFromClass(x.class), f.size.width, f.size.height, a, x.hidden ? @" hidden" : @""];
+            }
+        });
+    }
+    [o appendString:@"\n-- inputs / buttons --\n"];
+    for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
+        if (o.length > 14000 || x.hidden || !x.window) return;
+        CGRect f = [x convertRect:x.bounds toView:nil];
+        if ([x isKindOfClass:UITextField.class] || [x isKindOfClass:UITextView.class])
+            [o appendFormat:@"INPUT %@ y=%.0f %.0fx%.0f text=\"%@\"\n", NSStringFromClass(x.class), f.origin.y, f.size.width, f.size.height, RYClip(RYGetText(x), 20)];
+        else if ([x isKindOfClass:UIButton.class] && !RYInCell(x))
+            [o appendFormat:@"BTN y=%.0f x=%.0f %.0fx%.0f key=%@\n", f.origin.y, f.origin.x, f.size.width, f.size.height, RYClip(RYCtlKey((UIControl *)x), 50)];
+    });
+    [o appendString:@"\n-- logo candidates --\n"];
+    for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
+        if (o.length > 18000 || x.hidden || !x.window) return;
+        CGRect f = [x convertRect:x.bounds toView:nil];
+        if ([x isKindOfClass:UIImageView.class] && ((UIImageView *)x).image && f.size.height <= 140 && f.size.height > 8 && f.size.width / f.size.height >= 1.3)
+            [o appendFormat:@"IMG \"%@\" id=\"%@\" %.0fx%.0f y=%.0f\n", RYImgName(((UIImageView *)x).image), x.accessibilityIdentifier ?: @"", f.size.width, f.size.height, f.origin.y];
+        else if ([x isKindOfClass:UILabel.class] && [[((UILabel *)x).text lowercaseString] containsString:@"rave"])
+            [o appendFormat:@"LABEL \"%@\" y=%.0f\n", RYClip(((UILabel *)x).text, 30), f.origin.y];
+    });
+    return o;
+}
+
 #pragma mark - Window / root
 
 @interface RYWindow : UIWindow @end
@@ -332,7 +533,7 @@ static NSString *RYImageReport(void) {
 @property (nonatomic) NSInteger stamp;
 + (instancetype)shared;
 - (void)start; - (void)openPanel; - (void)panelClosed; - (void)bump;
-- (BOOL)sendMessage:(NSString *)msg;
+- (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger code))done;
 @end
 
 #pragma mark - Panel
@@ -369,7 +570,7 @@ static NSString *RYImageReport(void) {
     __weak typeof(self) ws = self;
     self.view.backgroundColor = RY_BG; self.view.overrideUserInterfaceStyle = UIUserInterfaceStyleDark; self.view.semanticContentAttribute = RYSem();
 
-    UILabel *title = RYLabel(@"Rayane", 22, UIFontWeightHeavy, nil); title.numberOfLines = 1;
+    UILabel *title = RYLabel(RYBrand(), 22, UIFontWeightHeavy, nil); title.numberOfLines = 1;
     UIView *spacer = [UIView new]; [spacer setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
@@ -486,8 +687,11 @@ static NSString *RYImageReport(void) {
     for (NSUInteger i = 0; i < msgs.count; i++) {
         NSString *m = msgs[i];
         UIButton *send = RYBtn(m, YES, ^{
-            BOOL ok = [[RYCore shared] sendMessage:m];
-            [ws toast:ok ? T(@"تم الإرسال", @"Sent") : T(@"ما لقيت خانة الدردشة", @"Chat input not found")];
+            [[RYCore shared] sendMessage:m done:^(NSInteger code) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [ws toast:code == 0 ? T(@"تم الإرسال", @"Sent") : code == 1 ? T(@"ما لقيت خانة الدردشة", @"Chat input not found") : T(@"ما انرسلت، افتح الدردشة وجرّب", @"Not sent, open the chat and retry")];
+                });
+            }];
         });
         UIButton *del = RYBtn(@"✕", NO, ^{ NSMutableArray *a = [msgs mutableCopy]; [a removeObjectAtIndex:i]; CS(@"messages", a); [ws rebuild]; });
         [del setContentHuggingPriority:1000 forAxis:UILayoutConstraintAxisHorizontal];
@@ -581,10 +785,14 @@ static NSString *RYImageReport(void) {
             UIPasteboard.generalPasteboard.string = o; [ws toast:T(@"اننسخت قائمة الشاشات", @"Screen list copied")];
         }),
         RYBtn(T(@"نسخ أسماء الصور بالشاشة", @"Copy on-screen image names"), NO, ^{ UIPasteboard.generalPasteboard.string = RYImageReport(); [ws toast:T(@"اننسخت", @"Copied")]; }),
+        RYBtn(T(@"نسخ تقرير تشخيصي", @"Copy diagnostic report"), YES, ^{ UIPasteboard.generalPasteboard.string = RYReport(); [ws toast:T(@"اننسخ التقرير", @"Report copied")]; }),
+        RYBtn([NSString stringWithFormat:T(@"اسم العلامة: %@", @"Brand name: %@"), RYBrand()], NO, ^{
+            [ws ask:T(@"الاسم اللي يظهر بدل rave", @"Name shown instead of rave") ph:@"Layan" secure:NO ok:^(NSString *x) { CS(@"brandName", x.length ? x : nil); [ws rebuild]; }];
+        }),
         RYBtn([NSString stringWithFormat:T(@"اسم شاشة الغرفة: %@", @"Room screen class: %@"), CF(@"roomClass", RY_ROOM_DEFAULT)], NO, ^{
             [ws ask:T(@"اسم الكلاس", @"Class name") ph:RY_ROOM_DEFAULT secure:NO ok:^(NSString *s) { CS(@"roomClass", s.length ? s : nil); [ws rebuild]; }];
         }),
-        RYBtn([NSString stringWithFormat:T(@"كلمات الشعار: %@", @"Logo match words: %@"), CF(@"brand", @"logo")], NO, ^{
+        RYBtn([NSString stringWithFormat:T(@"كلمات الشعار: %@", @"Logo match words: %@"), CF(@"brand", RY_BRAND_TOKENS)], NO, ^{
             [ws ask:T(@"كلمات مفصولة بفاصلة (فاضي = إيقاف)", @"Comma-separated (empty = off)") ph:@"logo" secure:NO ok:^(NSString *s) { CS(@"brand", s); [ws rebuild]; }];
         })])];
 }
@@ -655,7 +863,7 @@ static NSString *RYImageReport(void) {
     if (in && !self.wasIn && [CF(@"autoOpen", @NO) boolValue] && !RYLocked()) [self openPanel];
     self.wasIn = in;
     [self syncBG:room];
-    NSString *pat = CF(@"brand", @"logo");
+    NSString *pat = CF(@"brand", RY_BRAND_TOKENS);
     if (pat.length) {
         NSMutableArray *toks = [NSMutableArray new];
         for (NSString *t in [pat.lowercaseString componentsSeparatedByString:@","]) { NSString *x = [t stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]; if (x.length) [toks addObject:x]; }
@@ -665,35 +873,43 @@ static NSString *RYImageReport(void) {
 - (void)syncBG:(UIViewController *)room {
     BOOL want = room && ![CF(@"bgMode", @"none") isEqual:@"none"];
     if (!want) {
-        if (self.bgView) { [self.bgView removeFromSuperview]; self.bgView = nil; if (self.bgHost && self.origBg) self.bgHost.backgroundColor = self.origBg; self.bgHost = nil; }
+        if (self.bgView) { [self.bgView removeFromSuperview]; self.bgView = nil; self.bgHost = nil; RYRestoreAll(); }
         return;
     }
-    UIView *host = room.view;
-    if (self.bgView && self.bgView.superview != host) { [self.bgView removeFromSuperview]; self.bgView = nil; }
+    UIView *host = RYFullHost(room.view);
+    if (self.bgView && self.bgView.superview != host) { [self.bgView removeFromSuperview]; self.bgView = nil; RYRestoreAll(); }
     if (!self.bgView) {
         self.bgView = [[RYBGView alloc] initWithFrame:host.bounds]; self.bgView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        self.origBg = host.backgroundColor; self.bgHost = host; host.backgroundColor = UIColor.clearColor;
         [host insertSubview:self.bgView atIndex:0]; self.bgView.stamp = -1;
-    }
+    } else if (host.subviews.firstObject != self.bgView) { [host sendSubviewToBack:self.bgView]; }
+    self.bgHost = host;
+    // make everything that would hide the wallpaper see-through (re-applied every tick: the app resets colours on layout)
+    RYClear(host);
+    for (UIView *p = host.superview; p && ![p isKindOfClass:UIWindow.class]; p = p.superview) if (RYHasBG(p)) RYClear(p);
+    RYClearBig(host, host, self.bgView, 0);
     if (self.bgView.stamp != self.stamp) { [self.bgView apply]; self.bgView.stamp = self.stamp; }
 }
-- (BOOL)sendMessage:(NSString *)msg {
-    UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT)); if (!room) return NO;
+- (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
+    UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
     UIViewController *chat = RYFindVC(CF(@"chatClass", RY_CHAT_DEFAULT));
-    BOOL (^pred)(UIView *) = ^BOOL(UIView *x) { return ([x isKindOfClass:UITextField.class] || [x isKindOfClass:UITextView.class]) && !x.hidden && x.window; };
-    UIView *in = chat ? RYFindFirst(chat.view, pred) : nil; if (!in) in = RYFindFirst(room.view, pred); if (!in) return NO;
-    if ([in isKindOfClass:UITextField.class]) {
-        UITextField *tf = (UITextField *)in; tf.text = msg;
-        [tf sendActionsForControlEvents:UIControlEventEditingChanged]; [NSNotificationCenter.defaultCenter postNotificationName:UITextFieldTextDidChangeNotification object:tf];
-        BOOL ok = YES; if ([tf.delegate respondsToSelector:@selector(textFieldShouldReturn:)]) ok = [tf.delegate textFieldShouldReturn:tf];
-        [tf sendActionsForControlEvents:UIControlEventEditingDidEndOnExit]; (void)ok;
-    } else {
-        UITextView *tv = (UITextView *)in; tv.text = msg;
-        if ([tv.delegate respondsToSelector:@selector(textViewDidChange:)]) [tv.delegate textViewDidChange:tv];
-        [NSNotificationCenter.defaultCenter postNotificationName:UITextViewTextDidChangeNotification object:tv];
-        if ([tv.delegate respondsToSelector:@selector(textView:shouldChangeTextInRange:replacementText:)]) [tv.delegate textView:tv shouldChangeTextInRange:NSMakeRange(tv.text.length, 0) replacementText:@"\n"];
-    }
-    return YES;
+    UIView *in = chat ? RYBottomInput(chat.view) : nil;
+    if (!in && room) in = RYBottomInput(RYFullHost(room.view));
+    if (!in) for (UIWindow *w in RYAppWindows()) { in = RYBottomInput(w); if (in) break; }
+    if (!in) { done(1); return; }
+    NSString *prev = RYGetText(in) ?: @"";
+    RYSetText(in, msg);
+    UIControl *btn = RYSendBtnNear(in);
+    if (btn) [btn sendActionsForControlEvents:UIControlEventTouchUpInside]; else RYPressReturn(in);
+    __weak UIView *wi = in;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIView *x = wi;
+        if (!x || ![RYGetText(x) isEqualToString:msg]) { done(0); return; }   // field was cleared by the app = sent
+        RYPressReturn(x);                                                       // second try: return key
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIView *y = wi;
+            if (!y || ![RYGetText(y) isEqualToString:msg]) { done(0); } else { RYSetText(y, prev); done(2); }
+        });
+    });
 }
 @end
 
