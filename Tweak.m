@@ -256,18 +256,16 @@ static void RYBrandWalk(UIView *v, NSArray *toks) {
     }
     for (UIView *s in v.subviews) RYBrandWalk(s, toks);
 }
+static void RYImageWalk(UIView *v, NSMutableOrderedSet *o) {
+    if ([v isKindOfClass:UIImageView.class]) {
+        UIImageView *iv = (UIImageView *)v; NSString *n = RYImgName(iv.image);
+        if (iv.window && n.length) [o addObject:[NSString stringWithFormat:@"%@  %.0fx%.0f", n, iv.bounds.size.width, iv.bounds.size.height]];
+    }
+    for (UIView *s in v.subviews) RYImageWalk(s, o);
+}
 static NSString *RYImageReport(void) {
     NSMutableOrderedSet *o = [NSMutableOrderedSet new];
-    __block void (^walk)(UIView *) = nil;
-    walk = ^(UIView *v) {
-        if ([v isKindOfClass:UIImageView.class]) {
-            UIImageView *iv = (UIImageView *)v; NSString *n = RYImgName(iv.image);
-            if (iv.window && n.length) [o addObject:[NSString stringWithFormat:@"%@  %.0fx%.0f", n, iv.bounds.size.width, iv.bounds.size.height]];
-        }
-        for (UIView *s in v.subviews) walk(s);
-    };
-    for (UIWindow *w in RYAppWindows()) walk(w);
-    walk = nil;
+    for (UIWindow *w in RYAppWindows()) RYImageWalk(w, o);
     return [[o array] componentsJoinedByString:@"\n"];
 }
 
