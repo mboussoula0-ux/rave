@@ -252,6 +252,38 @@ static NSArray<NSString *> *RYSoundFiles(void) {
     return [all sortedArrayUsingSelector:@selector(compare:)];
 }
 
+#pragma mark - Event log (to find out why a room drops: app lifecycle, audio interruptions, route changes, room open/closed)
+
+static void RYLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt); NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap]; va_end(ap);
+    static NSDateFormatter *df; if (!df) { df = [NSDateFormatter new]; df.dateFormat = @"MM-dd HH:mm:ss"; }
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [df stringFromDate:NSDate.date], m];
+    NSString *p = [RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!h) { [line writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:nil]; return; }
+    if ([h seekToEndOfFile] > 60000) [h truncateFileAtOffset:0];
+    [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [h closeFile];
+}
+static NSString *RYLogTail(void) {
+    NSString *t = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    return t.length > 3500 ? [t substringFromIndex:t.length - 3500] : t;
+}
+static void RYStartEventLog(void) {
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    RYLog(@"=== launch (pid %d) ===", getpid());
+    NSDictionary *names = @{UIApplicationDidEnterBackgroundNotification: @"app: background", UIApplicationWillEnterForegroundNotification: @"app: foreground",
+        UIApplicationWillResignActiveNotification: @"app: resign active", UIApplicationDidBecomeActiveNotification: @"app: active",
+        UIApplicationDidReceiveMemoryWarningNotification: @"app: MEMORY WARNING", UIApplicationWillTerminateNotification: @"app: will terminate",
+        AVAudioSessionMediaServicesWereResetNotification: @"audio: media services reset", NSProcessInfoPowerStateDidChangeNotification: @"power state changed"};
+    for (NSString *n in names) { NSString *msg = names[n]; [nc addObserverForName:n object:nil queue:nil usingBlock:^(NSNotification *x) { RYLog(@"%@", msg); }]; }
+    [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:nil usingBlock:^(NSNotification *x) {
+        RYLog(@"audio: interruption type=%@ reason=%@", x.userInfo[AVAudioSessionInterruptionTypeKey], x.userInfo[AVAudioSessionInterruptionReasonKey]);
+    }];
+    [nc addObserverForName:AVAudioSessionRouteChangeNotification object:nil queue:nil usingBlock:^(NSNotification *x) {
+        RYLog(@"audio: route change reason=%@", x.userInfo[AVAudioSessionRouteChangeReasonKey]);
+    }];
+}
+
 #pragma mark - Mic booster (hooks AudioUnitRender on the mic bus used by WebRTC)
 
 static volatile BOOL gMicOn = NO;
@@ -456,7 +488,7 @@ static void RYSetIgnoreInt(BOOL on) { gIgnoreInt = on; CS(@"ignoreInt", @(on)); 
 static IMP orig_addObserver;
 static void ry_addObserver(id self, SEL _cmd, id obs, SEL sel, NSNotificationName name, id obj) {
     if (name && obs && [name isEqualToString:AVAudioSessionInterruptionNotification]) {
-        NSString *cn = NSStringFromClass([obs class]);
+        NSString *cn = NSStringFromClass(object_getClass(obs));
         if ([cn hasPrefix:@"Rave."] || [cn hasPrefix:@"_TtC4Rave"]) return;
     }
     ((void (*)(id, SEL, id, SEL, NSNotificationName, id))orig_addObserver)(self, _cmd, obs, sel, name, obj);
@@ -792,6 +824,7 @@ static NSString *RYReport(void) {
             }
         }
     }
+    [o appendFormat:@"\n-- event log (newest last) --\n%@\n", RYLogTail()];
     [o appendString:@"\n-- logo candidates --\n"];
     for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
         if (o.length > 18000 || x.hidden || !x.window) return;
@@ -1346,9 +1379,11 @@ static id RYInviteCtl(UIView *cell) {
     BOOL in = room != nil;
     self.fab.hidden = !in; self.fab.backgroundColor = RYAccent();
     if (in && !self.wasIn && [CF(@"autoOpen", @NO) boolValue] && !RYLocked()) [self openPanel];
+    if (in != self.wasIn) RYLog(in ? @"room: opened" : @"room: CLOSED (app state %ld)", (long)UIApplication.sharedApplication.applicationState);
     self.wasIn = in;
     [self syncBG:room];
-    NSString *pat = CF(@"brand", RY_BRAND_TOKENS);
+    static int brandTick = 0; brandTick++;
+    NSString *pat = (brandTick % 5 == 1) ? CF(@"brand", RY_BRAND_TOKENS) : @""; // logo walk only every ~4s: keeps the main thread free
     if (pat.length) {
         NSMutableArray *toks = [NSMutableArray new];
         for (NSString *t in [pat.lowercaseString componentsSeparatedByString:@","]) { NSString *x = [t stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]; if (x.length) [toks addObject:x]; }
@@ -1434,12 +1469,21 @@ static id RYInviteCtl(UIView *cell) {
 __attribute__((constructor)) static void RYInit(void) {
     if (![[NSBundle mainBundle].bundlePath.pathExtension isEqual:@"app"]) return; // skip app extensions
     RYLoad();
+    // crash-loop guard: if the previous launch died within 10 seconds, this launch skips the risky parts (Anti-AFK, audio hooks)
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    BOOL safe = [ud boolForKey:@"layan.launching"];
+    [ud setBool:YES forKey:@"layan.launching"]; [ud synchronize];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ud setBool:NO forKey:@"layan.launching"]; [ud synchronize]; });
+    RYStartEventLog();
+    RYLog(@"mode: %@", safe ? @"SAFE (previous launch crashed)" : @"normal");
     gKeepOn = YES; gIgnoreInt = YES; // Anti-AFK is always on: no switch, not stored, not importable
-    RYInstallInterruptFilter();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [[RYKeep shared] start]; });
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { [[RYKeep shared] start]; }]; // re-arm if location was just allowed
-    gMicOn = [CF(@"micOn", @NO) boolValue]; gMicGain = [CF(@"micGain", @2.0) floatValue];
-    gNoIso = [CF(@"noIso", @NO) boolValue]; gNoAGC = [CF(@"noAgc", @NO) boolValue];
-    if (gMicOn || gNoIso || gNoAGC) RYInstallAudioHooks();
+    if (!safe) {
+        RYInstallInterruptFilter();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [[RYKeep shared] start]; });
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { [[RYKeep shared] start]; }];
+        gMicOn = [CF(@"micOn", @NO) boolValue]; gMicGain = [CF(@"micGain", @2.0) floatValue];
+        gNoIso = [CF(@"noIso", @NO) boolValue]; gNoAGC = [CF(@"noAgc", @NO) boolValue];
+        if (gMicOn || gNoIso || gNoAGC) RYInstallAudioHooks();
+    } else { gMicOn = NO; gNoIso = NO; gNoAGC = NO; }
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { [[RYCore shared] start]; }];
 }
