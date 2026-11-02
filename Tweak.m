@@ -534,6 +534,11 @@ static NSString *RYReport(void) {
 + (instancetype)shared;
 - (void)start; - (void)openPanel; - (void)panelClosed; - (void)bump;
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger code))done;
+// one-shot invite pass over the visible list (Recents / Friends screen)
+@property (nonatomic) BOOL invRunning;
+@property (nonatomic) NSInteger invSent;
+@property (nonatomic, copy) NSString *invStatus;
+- (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft;
 @end
 
 #pragma mark - Panel
@@ -541,11 +546,13 @@ static NSString *RYReport(void) {
 @interface RYPanel : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate, UIColorPickerViewControllerDelegate>
 @property (nonatomic) NSInteger tab;
 @property (nonatomic, strong) UIStackView *stack;
+@property (nonatomic, strong) UILabel *invLabel;
+@property (nonatomic, strong) NSTimer *invUI;
 @end
 
 @implementation RYPanel
 - (void)viewDidLoad { [super viewDidLoad]; [self rebuild]; }
-- (void)viewDidDisappear:(BOOL)a { [super viewDidDisappear:a]; if (self.isBeingDismissed) [[RYCore shared] panelClosed]; }
+- (void)viewDidDisappear:(BOOL)a { [super viewDidDisappear:a]; [self.invUI invalidate]; self.invUI = nil; if (self.isBeingDismissed) [[RYCore shared] panelClosed]; }
 
 - (void)toast:(NSString *)s {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -575,9 +582,10 @@ static NSString *RYReport(void) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"رسائل سريعة", @"Quick messages"), T(@"الأصوات", @"Sounds"), T(@"الإعدادات", @"Settings")];
+    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الأصوات", @"Sounds"), T(@"الإعدادات", @"Settings")];
     NSMutableArray *tb = [NSMutableArray new];
     for (NSInteger i = 0; i < (NSInteger)names.count; i++) { [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
+    [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
     UIStackView *tabStack = RYHStack(tb, 8); tabStack.alignment = UIStackViewAlignmentFill;
     UIScrollView *scroll = [UIScrollView new]; scroll.alwaysBounceVertical = YES; scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     self.stack = RYVStack(@[], 12);
@@ -603,7 +611,7 @@ static NSString *RYReport(void) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderMsgs]; break; case 2: [self renderSounds]; break; default: [self renderSettings]; }
+    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 3: [self renderSounds]; break; default: [self renderSettings]; }
 }
 
 #pragma mark Locked
@@ -678,6 +686,39 @@ static NSString *RYReport(void) {
     [r.itemProvider loadDataRepresentationForTypeIdentifier:@"public.image" completionHandler:^(NSData *d, NSError *e) { [ws saveBGData:d]; }];
 }
 - (void)colorPickerViewController:(UIColorPickerViewController *)vc didSelectColor:(UIColor *)color continuously:(BOOL)c { [self setBG:@"color" value:RYHexFrom(color)]; }
+
+#pragma mark Invites
+- (NSString *)invText {
+    RYCore *c = [RYCore shared];
+    if (c.invRunning) return [NSString stringWithFormat:T(@"شغّال… انرسل %ld دعوة\n%@", @"Running… %ld sent\n%@"), (long)c.invSent, c.invStatus ?: @""];
+    NSInteger left = [c invCooldownLeft];
+    if (left > 0) return [NSString stringWithFormat:T(@"آخر تشغيل: %ld دعوة. تقدر تشغّل بعد %ld:%02ld", @"Last run: %ld sent. Available again in %ld:%02ld"), (long)c.invSent, (long)(left / 60), (long)(left % 60)];
+    return c.invStatus.length ? c.invStatus : T(@"جاهز", @"Ready");
+}
+- (void)renderInvites {
+    __weak typeof(self) ws = self;
+    [self.stack addArrangedSubview:RYCard(@[
+        RYLabel(T(@"دعوة كل اللي بالقائمة", @"Invite everyone in the list"), 16, UIFontWeightBold, nil),
+        RYLabel(T(@"افتح شاشة الريسنت (أو الأصدقاء) في Rave، وخلّها ظاهرة، وبعدين اضغط ابدأ. يمر على كل شخص مرة وحدة بس، وبعدها يوقف. ما يعيد الإرسال لنفس الناس.", @"Open the Recents (or Friends) screen in Rave and keep it visible, then press Start. It goes through each person once and stops. It never re-sends to the same people."), 13, UIFontWeightRegular, RY_MUTED)])];
+    self.invLabel = RYLabel([self invText], 14, UIFontWeightMedium, nil);
+    UIButton *go = RYBtn(T(@"ابدأ الدعوات", @"Start invites"), YES, ^{
+        RYCore *c = [RYCore shared];
+        if (c.invRunning) return;
+        if ([c invCooldownLeft] > 0) { [ws toast:T(@"انتظر انتهاء المؤقت (4 دقايق)", @"Wait for the 4-minute cooldown")]; return; }
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"تأكيد", @"Confirm") message:T(@"إرسال دعوة لكل شخص ظاهر في القائمة الحالية (مرة وحدة)؟", @"Send one invite to everyone in the current list?") preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:T(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+        [a addAction:[UIAlertAction actionWithTitle:T(@"ابدأ", @"Start") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [c startInvites]; [ws startInvUI]; }]];
+        [ws presentViewController:a animated:YES completion:nil];
+    });
+    UIButton *stop = RYBtn(T(@"إيقاف", @"Stop"), NO, ^{ [[RYCore shared] stopInvites]; });
+    [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYHStack(@[go, stop], 8)])];
+    [self.stack addArrangedSubview:RYLabel(T(@"ملاحظة: يعتمد على أزرار الدعوة الموجودة بالشاشة. لو ما اشتغل انسخ \"تقرير تشخيصي\" من الإعدادات وأرسله لي.", @"Note: it drives the invite buttons that are on screen. If nothing happens, copy the diagnostic report from Settings and send it to me."), 12, UIFontWeightRegular, RY_MUTED)];
+    [self startInvUI];
+}
+- (void)startInvUI {
+    [self.invUI invalidate]; __weak typeof(self) ws = self;
+    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = [ws invText]; }];
+}
 
 #pragma mark Quick messages
 - (void)renderMsgs {
@@ -889,6 +930,76 @@ static NSString *RYReport(void) {
     RYClearBig(host, host, self.bgView, 0);
     if (self.bgView.stamp != self.stamp) { [self.bgView apply]; self.bgView.stamp = self.stamp; }
 }
+@end
+
+#pragma mark Invites engine
+static NSMutableSet *gInvDone; static int gInvIdle; static NSTimer *gInvTimer; static NSTimeInterval gInvLast;
+static UIScrollView *RYBiggestList(void) {
+    __block UIScrollView *best = nil; __block CGFloat ba = 0;
+    for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
+        if (!([x isKindOfClass:UITableView.class] || [x isKindOfClass:UICollectionView.class]) || x.hidden || !x.window || x.alpha < 0.05) return;
+        CGRect f = CGRectIntersection([x convertRect:x.bounds toView:nil], x.window.bounds); CGFloat a = f.size.width * f.size.height;
+        if (a > ba) { ba = a; best = (UIScrollView *)x; }
+    });
+    return best;
+}
+static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv) {
+    if ([sv isKindOfClass:UITableView.class]) return ((UITableView *)sv).visibleCells;
+    return ((UICollectionView *)sv).visibleCells;
+}
+static void RYCellTexts(UIView *v, NSMutableString *o, int d) {
+    if (d > 10) return;
+    if ([v isKindOfClass:UILabel.class] && ((UILabel *)v).text.length) [o appendFormat:@"%@|", ((UILabel *)v).text];
+    for (UIView *s in v.subviews) RYCellTexts(s, o, d + 1);
+}
+// the invite control inside a row: key contains an invite word, and none of the "already done" words
+static UIControl *RYInviteCtl(UIView *cell) {
+    NSMutableArray *c = [NSMutableArray new]; RYCollectCtl(cell, c, 0);
+    NSArray *good = @[@"invite", @"دعو", @"دعوه", @"add to room", @"person.badge.plus", @"plus"];
+    NSArray *bad = @[@"invited", @"تمت", @"تم ", @"sent", @"pending", @"remove", @"block", @"report", @"unfriend", @"chat", @"message"];
+    for (UIControl *b in c) {
+        NSString *k = RYCtlKey(b); BOOL skip = NO;
+        for (NSString *w in bad) if ([k containsString:w]) { skip = YES; break; }
+        if (skip) continue;
+        for (NSString *w in good) if ([k containsString:w]) return b;
+    }
+    return nil;
+}
+@implementation RYCore (Invites)
+- (NSInteger)invCooldownLeft { if (!gInvLast) return 0; NSInteger l = (NSInteger)(240 - ([NSDate date].timeIntervalSince1970 - gInvLast)); return l > 0 ? l : 0; }
+- (void)stopInvites {
+    [gInvTimer invalidate]; gInvTimer = nil;
+    if (self.invRunning) { self.invRunning = NO; gInvLast = [NSDate date].timeIntervalSince1970; self.invStatus = [NSString stringWithFormat:T(@"وقف. انرسل %ld دعوة.", @"Stopped. %ld invites sent."), (long)self.invSent]; }
+}
+- (void)startInvites {
+    if (self.invRunning || [self invCooldownLeft] > 0) return;
+    gInvDone = [NSMutableSet new]; gInvIdle = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
+    gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.9 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
+}
+- (void)invFinish:(NSString *)why {
+    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; gInvLast = [NSDate date].timeIntervalSince1970;
+    self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
+}
+- (void)invStep {
+    UIScrollView *sv = RYBiggestList();
+    if (!sv) { if (++gInvIdle > 6) [self invFinish:T(@"ما لقيت قائمة بالشاشة. انرسل:", @"No list on screen. Sent:")]; return; }
+    for (UIView *cell in RYVisibleCells(sv)) {
+        NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
+        if (!key.length) [key appendFormat:@"%p", cell];
+        if ([gInvDone containsObject:key]) continue;
+        UIControl *b = RYInviteCtl(cell);
+        [gInvDone addObject:key];
+        if (b) { [b sendActionsForControlEvents:UIControlEventTouchUpInside]; self.invSent++; self.invStatus = [NSString stringWithFormat:T(@"آخر واحد: %@", @"Last: %@"), RYClip(key, 24)]; gInvIdle = 0; return; }
+    }
+    // nothing new on this screenful: scroll one page; stop after two failed scrolls at the end
+    CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
+    if (sv.contentOffset.y >= maxY - 2) { if (++gInvIdle >= 2) [self invFinish:T(@"خلصت القائمة. انرسل:", @"Reached the end. Sent:")]; return; }
+    [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
+    gInvIdle = 0;
+}
+@end
+
+@implementation RYCore (Messaging)
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
     UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
     UIViewController *chat = RYFindVC(CF(@"chatClass", RY_CHAT_DEFAULT));
