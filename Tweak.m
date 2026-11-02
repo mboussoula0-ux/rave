@@ -435,6 +435,23 @@ static NSString *RYCtlKey(UIControl *b) {
     }
     return k.lowercaseString;
 }
+// SwiftUI rows are not UIControls: reach their buttons through the accessibility tree
+static void RYA11yCollect(id o, NSMutableArray *out, int d) {
+    if (!o || d > 9) return;
+    if ([o isKindOfClass:UIView.class]) {
+        UIView *v = o; if (v.hidden) return;
+        if (v.isAccessibilityElement) [out addObject:v];
+        NSArray *e = v.accessibilityElements; if (e) for (id x in e) RYA11yCollect(x, out, d + 1);
+        for (UIView *sv in v.subviews) RYA11yCollect(sv, out, d + 1);
+    } else {
+        if ([o isAccessibilityElement]) [out addObject:o];
+        NSArray *e = [o accessibilityElements]; if (e) for (id x in e) RYA11yCollect(x, out, d + 1);
+    }
+}
+static NSString *RYA11yKey(id e) {
+    NSString *l = [e accessibilityLabel] ?: @"", *i = [e respondsToSelector:@selector(accessibilityIdentifier)] ? ([e accessibilityIdentifier] ?: @"") : @"";
+    return [NSString stringWithFormat:@"%@|%@|%llu", l, i, (unsigned long long)[e accessibilityTraits]].lowercaseString;
+}
 static UIControl *RYSendBtnNear(UIView *in) {
     NSArray *good = @[@"send", @"إرسال", @"ارسال", @"submit", @"paperplane", @"paper_plane", @"arrow.up", @"arrow_up"];
     NSArray *bad = @[@"sticker", @"emoji", @"gif", @"mic", @"voice", @"camera", @"attach", @"photo", @"gift"];
@@ -490,6 +507,20 @@ static NSString *RYReport(void) {
             [o appendFormat:@"INPUT %@ y=%.0f %.0fx%.0f text=\"%@\"\n", NSStringFromClass(x.class), f.origin.y, f.size.width, f.size.height, RYClip(RYGetText(x), 20)];
         else if ([x isKindOfClass:UIButton.class] && !RYInCell(x))
             [o appendFormat:@"BTN y=%.0f x=%.0f %.0fx%.0f key=%@\n", f.origin.y, f.origin.x, f.size.width, f.size.height, RYClip(RYCtlKey((UIControl *)x), 50)];
+    });
+    [o appendString:@"\n-- list rows (accessibility) --\n"];
+    __block int rows = 0;
+    for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
+        if (rows >= 4 || o.length > 22000 || x.hidden || !x.window) return;
+        if (![x isKindOfClass:UICollectionView.class] && ![x isKindOfClass:UITableView.class]) return;
+        NSArray *cells = [x isKindOfClass:UITableView.class] ? ((UITableView *)x).visibleCells : ((UICollectionView *)x).visibleCells;
+        for (UIView *c in cells) {
+            if (rows >= 4) break; rows++;
+            NSMutableString *t = [NSMutableString new]; RYWalk(c, 0, ^(UIView *y, int dd) { if ([y isKindOfClass:UILabel.class] && ((UILabel *)y).text.length) [t appendFormat:@"%@ ; ", RYClip(((UILabel *)y).text, 20)]; });
+            NSMutableArray *a = [NSMutableArray new]; RYA11yCollect(c, a, 0);
+            [o appendFormat:@"ROW %@ texts=%@\n", NSStringFromClass(c.class), t];
+            for (id e in a) [o appendFormat:@"   A11Y %@ %@\n", NSStringFromClass([e class]), RYClip(RYA11yKey(e), 70)];
+        }
     });
     [o appendString:@"\n-- logo candidates --\n"];
     for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
@@ -872,7 +903,7 @@ static void RYCellTexts(UIView *v, NSMutableString *o, int d) {
     for (UIView *s in v.subviews) RYCellTexts(s, o, d + 1);
 }
 // the invite control inside a row: key contains an invite word, and none of the "already done" words
-static UIControl *RYInviteCtl(UIView *cell) {
+static id RYInviteCtl(UIView *cell) {
     NSMutableArray *c = [NSMutableArray new]; RYCollectCtl(cell, c, 0);
     NSArray *good = @[@"invite", @"دعو", @"دعوه", @"add to room", @"person.badge.plus", @"plus"];
     NSArray *bad = @[@"invited", @"تمت", @"تم ", @"sent", @"pending", @"remove", @"block", @"report", @"unfriend", @"chat", @"message"];
@@ -881,6 +912,13 @@ static UIControl *RYInviteCtl(UIView *cell) {
         for (NSString *w in bad) if ([k containsString:w]) { skip = YES; break; }
         if (skip) continue;
         for (NSString *w in good) if ([k containsString:w]) return b;
+    }
+    NSMutableArray *ax = [NSMutableArray new]; RYA11yCollect(cell, ax, 0);
+    for (id e in ax) {
+        NSString *k = RYA11yKey(e); BOOL skip = NO;
+        for (NSString *w in bad) if ([k containsString:w]) { skip = YES; break; }
+        if (skip) continue;
+        for (NSString *w in good) if ([k containsString:w]) return e;
     }
     return nil;
 }
@@ -979,9 +1017,9 @@ static UIControl *RYInviteCtl(UIView *cell) {
         NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
         if (!key.length) [key appendFormat:@"%p", cell];
         if ([gInvDone containsObject:key]) continue;
-        UIControl *b = RYInviteCtl(cell);
+        id b = RYInviteCtl(cell);
         [gInvDone addObject:key];
-        if (b) { [b sendActionsForControlEvents:UIControlEventTouchUpInside]; self.invSent++; self.invStatus = [NSString stringWithFormat:T(@"آخر واحد: %@", @"Last: %@"), RYClip(key, 24)]; gInvIdle = 0; return; }
+        if (b) { if ([b isKindOfClass:UIControl.class]) [(UIControl *)b sendActionsForControlEvents:UIControlEventTouchUpInside]; else [b accessibilityActivate]; self.invSent++; self.invStatus = [NSString stringWithFormat:T(@"آخر واحد: %@", @"Last: %@"), RYClip(key, 24)]; gInvIdle = 0; return; }
     }
     // nothing new on this screenful: scroll one page; stop after two failed scrolls at the end
     CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
