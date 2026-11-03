@@ -245,22 +245,25 @@ static NSURL *RYParseRoomURL(NSString *s) {
 static NSMutableString *gJoinLog;
 static BOOL RYDeliverURL(NSURL *u) {
     UIApplication *app = UIApplication.sharedApplication;
-    NSUserActivity *act = [[NSUserActivity alloc] initWithActivityType:NSUserActivityTypeBrowsingWeb];
-    act.webpageURL = u;
+    BOOL web = [u.scheme.lowercaseString hasPrefix:@"http"];
     BOOL handled = NO;
     [gJoinLog appendFormat:@"deliver: %@\n", u];
-    for (UIScene *sc in app.connectedScenes) {
-        id d = sc.delegate;
-        BOOL r = [d respondsToSelector:@selector(scene:continueUserActivity:)];
-        [gJoinLog appendFormat:@" scene %@ continue: %@\n", NSStringFromClass([d class]), r ? @"yes" : @"no"];
-        if (r) { [d scene:sc continueUserActivity:act]; handled = YES; }
-    }
     id ad = app.delegate;
-    BOOL ra = [ad respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)];
-    [gJoinLog appendFormat:@" appdelegate %@ continue: %@\n", NSStringFromClass([ad class]), ra ? @"yes" : @"no"];
-    if (!handled && ra) {
-        handled = [ad application:app continueUserActivity:act restorationHandler:^(NSArray<id<UIUserActivityRestoring>> *x) {}];
-        [gJoinLog appendFormat:@"  -> returned %d\n", handled];
+    if (web) { // NSUserActivity.webpageURL accepts only http/https (anything else throws)
+        NSUserActivity *act = [[NSUserActivity alloc] initWithActivityType:NSUserActivityTypeBrowsingWeb];
+        act.webpageURL = u;
+        for (UIScene *sc in app.connectedScenes) {
+            id d = sc.delegate;
+            BOOL r = [d respondsToSelector:@selector(scene:continueUserActivity:)];
+            [gJoinLog appendFormat:@" scene %@ continue: %@\n", NSStringFromClass([d class]), r ? @"yes" : @"no"];
+            if (r) { [d scene:sc continueUserActivity:act]; handled = YES; }
+        }
+        BOOL ra = [ad respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)];
+        [gJoinLog appendFormat:@" appdelegate continue: %@\n", ra ? @"yes" : @"no"];
+        if (!handled && ra) {
+            handled = [ad application:app continueUserActivity:act restorationHandler:^(NSArray<id<UIUserActivityRestoring>> *x) {}];
+            [gJoinLog appendFormat:@"  -> returned %d\n", handled];
+        }
     }
     BOOL ro = [ad respondsToSelector:@selector(application:openURL:options:)];
     [gJoinLog appendFormat:@" appdelegate openURL: %@\n", ro ? @"yes" : @"no"];
@@ -268,7 +271,37 @@ static BOOL RYDeliverURL(NSURL *u) {
         handled = [ad application:app openURL:u options:@{}];
         [gJoinLog appendFormat:@"  -> returned %d\n", handled];
     }
+    if (!handled && !web) { // custom scheme registered by the app itself: let iOS route it back to us
+        [app openURL:u options:@{} completionHandler:nil];
+        [gJoinLog appendString:@" UIApplication openURL fired\n"]; handled = YES;
+    }
     return handled;
+}
+// the landing page of a short link usually contains the real deep link: collect every URL in it, app schemes first
+static NSArray<NSURL *> *RYCandidates(NSString *html) {
+    if (!html.length) return @[];
+    html = [html stringByReplacingOccurrencesOfString:@"\\/" withString:@"/"];
+    html = [html stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+    NSMutableOrderedSet *out = [NSMutableOrderedSet new];
+    NSArray *noise = @[@"apple.com", @"google", @"gstatic", @"w3.org", @"facebook", @"twitter", @"fonts.", @"schema.org", @"cloudflare", @"jsdelivr", @"cdnjs", @"itunes"];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[A-Za-z][A-Za-z0-9+.\\-]*://[^\\s\"'<>\\\\)]+" options:0 error:nil];
+    for (NSTextCheckingResult *m in [re matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
+        NSString *x = [[html substringWithRange:m.range] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@".,;"]];
+        BOOL skip = NO; for (NSString *n in noise) if ([x containsString:n]) { skip = YES; break; }
+        NSURL *u = skip ? nil : [NSURL URLWithString:x];
+        if (u) [out addObject:u];
+    }
+    NSRegularExpression *mid = [NSRegularExpression regularExpressionWithPattern:@"mesh_?[iI]d[\"'=: ]+([A-Za-z0-9_\\-]{6,})" options:0 error:nil];
+    NSTextCheckingResult *mm = [mid firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
+    if (mm) {
+        NSString *id_ = [html substringWithRange:[mm rangeAtIndex:1]];
+        [gJoinLog appendFormat:@"mesh id in page: %@\n", id_];
+        NSURL *g = [NSURL URLWithString:[@"wemesh://mesh/" stringByAppendingString:id_]]; if (g) [out addObject:g];
+    }
+    return [[out array] sortedArrayWithOptions:NSSortStable usingComparator:^NSComparisonResult(NSURL *p, NSURL *q) {
+        BOOL cp = ![p.scheme.lowercaseString hasPrefix:@"http"], cq = ![q.scheme.lowercaseString hasPrefix:@"http"];
+        return cp == cq ? NSOrderedSame : (cp ? NSOrderedAscending : NSOrderedDescending);
+    }];
 }
 static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
     gJoinLog = [NSMutableString stringWithFormat:@"link: %@\n", u];
@@ -277,9 +310,16 @@ static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
     [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
         NSURL *f = resp.URL;
         NSInteger code = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+        NSString *html = d.length ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
         dispatch_async(dispatch_get_main_queue(), ^{
             [gJoinLog appendFormat:@"fetch: status=%ld error=%@ final=%@ bytes=%lu\n", (long)code, e.localizedDescription, f, (unsigned long)d.length];
-            done((f && ![f isEqual:u]) ? RYDeliverURL(f) : NO);
+            BOOL ok = (f && ![f isEqual:u]) ? RYDeliverURL(f) : NO;
+            if (!ok && html) {
+                NSArray *c = RYCandidates(html); [gJoinLog appendFormat:@"candidates: %lu\n", (unsigned long)c.count];
+                int n = 0; for (NSURL *cu in c) { if (n++ >= 8) break; if (RYDeliverURL(cu)) { ok = YES; break; } }
+            }
+            if (!ok && html) [gJoinLog appendFormat:@"html:\n%@\n", html.length > 1800 ? [html substringToIndex:1800] : html];
+            done(ok);
         });
     }] resume];
 }
@@ -1097,6 +1137,33 @@ static id RYInviteCtl(UIView *cell) {
     }
     return nil;
 }
+static NSMutableString *gInvLog; static NSInteger gInvOK;
+// activate one invite control. events first (works for UIKit buttons and UIAction buttons), accessibility activation as a delayed fallback
+static void RYActivateCtl(id b) {
+    if (!gInvLog) gInvLog = [NSMutableString new];
+    if ([b isKindOfClass:UIControl.class]) {
+        UIControl *c = (UIControl *)b; NSString *k0 = RYCtlKey(c); __weak UIControl *wc = c;
+        [gInvLog appendFormat:@"ctl %@ key=%@ events=%lu\n", NSStringFromClass(c.class), k0, (unsigned long)c.allControlEvents];
+        [c sendActionsForControlEvents:UIControlEventTouchDown];
+        [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+        [c sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIControl *x = wc;
+            if (!x || !x.window || !x.enabled || ![RYCtlKey(x) isEqualToString:k0]) { gInvOK++; [gInvLog appendFormat:@"  changed after tap: ok (%@)\n", k0]; return; }
+            BOOL r = [x accessibilityActivate];
+            [gInvLog appendFormat:@"  unchanged -> a11y activate=%d (%@)\n", r, k0];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UIControl *y = wc;
+                if (!y || !y.window || !y.enabled || ![RYCtlKey(y) isEqualToString:k0]) { gInvOK++; [gInvLog appendFormat:@"  changed after a11y: ok (%@)\n", k0]; }
+                else [gInvLog appendFormat:@"  STILL unchanged (%@)\n", k0];
+            });
+        });
+    } else {
+        BOOL r = [b accessibilityActivate];
+        [gInvLog appendFormat:@"elem %@ a11y=%d key=%@\n", NSStringFromClass([b class]), r, RYA11yKey(b)];
+        if (r) gInvOK++;
+    }
+}
 @implementation RYCore
 + (instancetype)shared { static RYCore *c; static dispatch_once_t t; dispatch_once(&t, ^{ c = [RYCore new]; }); return c; }
 - (void)bump { self.stamp++; }
@@ -1180,12 +1247,13 @@ static id RYInviteCtl(UIView *cell) {
 }
 - (void)startInvites {
     if (self.invRunning || [self invCooldownLeft] > 0) return;
-    gInvDone = [NSMutableSet new]; gInvIdle = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
+    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
     gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.9 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
 }
 - (void)invFinish:(NSString *)why {
     [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; gInvLast = [NSDate date].timeIntervalSince1970;
-    self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
+    self.invStatus = [NSString stringWithFormat:@"%@ %ld (%@ %ld)", why, (long)self.invSent, T(@"مؤكد", @"confirmed"), (long)gInvOK];
+    if (gInvOK == 0 && self.invSent > 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما تأكد أي إرسال، انسخت التفاصيل", @" - none confirmed, details copied")]; }
 }
 - (void)invStep {
     UIScrollView *sv = RYBiggestList();
@@ -1196,7 +1264,7 @@ static id RYInviteCtl(UIView *cell) {
         if ([gInvDone containsObject:key]) continue;
         id b = RYInviteCtl(cell);
         [gInvDone addObject:key];
-        if (b) { if ([b isKindOfClass:UIControl.class]) [(UIControl *)b sendActionsForControlEvents:UIControlEventTouchUpInside]; else [b accessibilityActivate]; self.invSent++; self.invStatus = [NSString stringWithFormat:T(@"آخر واحد: %@", @"Last: %@"), RYClip(key, 24)]; gInvIdle = 0; return; }
+        if (b) { RYActivateCtl(b); self.invSent++; self.invStatus = [NSString stringWithFormat:T(@"آخر واحد: %@", @"Last: %@"), RYClip(key, 24)]; gInvIdle = 0; return; }
     }
     // nothing new on this screenful: scroll one page; stop after two failed scrolls at the end
     CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
