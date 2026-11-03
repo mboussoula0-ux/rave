@@ -354,15 +354,6 @@ static BOOL gKeepOn = YES;
 @implementation RYKeep
 + (instancetype)shared { static RYKeep *k; static dispatch_once_t o; dispatch_once(&o, ^{ k = [RYKeep new]; }); return k; }
 static BOOL RYHasBgMode(NSString *m) { return [[NSBundle.mainBundle objectForInfoDictionaryKey:@"UIBackgroundModes"] containsObject:m]; }
-- (void)hud:(NSString *)s {
-    UIView *host = self.win.rootViewController.view; if (!host) return;
-    UILabel *l = RYLabel(s, 14, UIFontWeightMedium, nil); l.textAlignment = NSTextAlignmentCenter; l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
-    l.layer.cornerRadius = 12; l.clipsToBounds = YES; l.userInteractionEnabled = NO;
-    CGSize z = [l sizeThatFits:CGSizeMake(host.bounds.size.width - 60, CGFLOAT_MAX)];
-    l.frame = CGRectMake(0, 0, z.width + 28, z.height + 18); l.center = CGPointMake(host.bounds.size.width / 2, host.bounds.size.height - 110);
-    [host addSubview:l];
-    [UIView animateWithDuration:0.4 delay:4 options:0 animations:^{ l.alpha = 0; } completion:^(BOOL f) { [l removeFromSuperview]; }];
-}
 - (void)start {
     if (self.lm) { CLAuthorizationStatus a = self.lm.authorizationStatus; if (a == kCLAuthorizationStatusAuthorizedWhenInUse || a == kCLAuthorizationStatusAuthorizedAlways) [self.lm startUpdatingLocation]; return; }
     CLLocationManager *m = [CLLocationManager new]; m.delegate = self;
@@ -1204,6 +1195,15 @@ static void RYActivateCtl(id b) {
 + (instancetype)shared { static RYCore *c; static dispatch_once_t t; dispatch_once(&t, ^{ c = [RYCore new]; }); return c; }
 - (void)bump { self.stamp++; }
 
+- (void)hud:(NSString *)s {
+    UIView *host = self.win.rootViewController.view; if (!host) return;
+    UILabel *l = RYLabel(s, 14, UIFontWeightMedium, nil); l.textAlignment = NSTextAlignmentCenter; l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
+    l.layer.cornerRadius = 12; l.clipsToBounds = YES; l.userInteractionEnabled = NO;
+    CGSize z = [l sizeThatFits:CGSizeMake(host.bounds.size.width - 60, CGFLOAT_MAX)];
+    l.frame = CGRectMake(0, 0, z.width + 28, z.height + 18); l.center = CGPointMake(host.bounds.size.width / 2, host.bounds.size.height - 110);
+    [host addSubview:l];
+    [UIView animateWithDuration:0.4 delay:4 options:0 animations:^{ l.alpha = 0; } completion:^(BOOL f) { [l removeFromSuperview]; }];
+}
 - (void)start {
     if (self.win) return;
     UIWindowScene *sc = nil;
