@@ -1,4 +1,4 @@
-// Layan — local feature set for Rave on iPhone (injected dylib)
+// Layan — local feature set (injected dylib) (injected dylib)
 // Pure Objective-C runtime: no Substrate / no Logos, so it works with Feather / ESign / Sideloadly injection.
 // UNTESTED on a device: class names are tunable from Settings > Advanced.
 
@@ -33,7 +33,7 @@ static void CS(NSString *k, id v) {
     @try { [[NSUserDefaults standardUserDefaults] setObject:gCfg forKey:RY_CFG]; } @catch (__unused id e) {}
 }
 static NSString *RYDir(NSString *sub) {
-    NSString *b = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"Rayane"] copy];
+    NSString *b = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"Layan"] copy];
     if (sub) b = [b stringByAppendingPathComponent:sub];
     [[NSFileManager defaultManager] createDirectoryAtPath:b withIntermediateDirectories:YES attributes:nil error:nil];
     return b;
@@ -71,7 +71,7 @@ static UIColor *RYAccent(void) {
 #define RY_MUTED RYHex(@"#8A90A0")
 
 static NSString *RYHash(NSString *s) {
-    NSData *d = [[@"rayane|" stringByAppendingString:s ?: @""] dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *d = [[@"layan|" stringByAppendingString:s ?: @""] dataUsingEncoding:NSUTF8StringEncoding];
     unsigned char h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(d.bytes, (CC_LONG)d.length, h);
     NSMutableString *o = [NSMutableString new];
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [o appendFormat:@"%02x", h[i]];
@@ -871,7 +871,7 @@ static void RYMsgLoopSet(BOOL on) {
     __weak typeof(self) ws = self;
     [self.stack addArrangedSubview:RYCard(@[
         RYLabel(T(@"دعوة كل اللي بالقائمة", @"Invite everyone in the list"), 16, UIFontWeightBold, nil),
-        RYLabel(T(@"افتح شاشة الريسنت (أو الأصدقاء) في Rave، وخلّها ظاهرة، وبعدين اضغط ابدأ. يمر على كل شخص مرة وحدة بس، وبعدها يوقف. ما يعيد الإرسال لنفس الناس.", @"Open the Recents (or Friends) screen in Rave and keep it visible, then press Start. It goes through each person once and stops. It never re-sends to the same people."), 13, UIFontWeightRegular, RY_MUTED)])];
+        RYLabel(T(@"افتح شاشة الريسنت (أو الأصدقاء) في Layan، وخلّها ظاهرة، وبعدين اضغط ابدأ. يمر على كل شخص مرة وحدة بس، وبعدها يوقف. ما يعيد الإرسال لنفس الناس.", @"Open the Recents (or Friends) screen in Rave and keep it visible, then press Start. It goes through each person once and stops. It never re-sends to the same people."), 13, UIFontWeightRegular, RY_MUTED)])];
     self.invLabel = RYLabel([self invText], 14, UIFontWeightMedium, nil);
     UIButton *go = RYBtn(T(@"ابدأ الدعوات", @"Start invites"), YES, ^{
         RYCore *c = [RYCore shared];
