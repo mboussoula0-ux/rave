@@ -994,9 +994,20 @@ static void RYMsgLoopSet(BOOL on) {
     NSURL *u = RYParseRoomURL(str);
     if (!u) { [self toast:T(@"ما لقيت رابط", @"No link found")]; return; }
     [self toast:T(@"جاري الدخول...", @"Joining...")];
+    UIViewController *before = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
     RYJoinLink(u, ^(BOOL ok) {
         if (!ok) { UIPasteboard.generalPasteboard.string = gJoinLog ?: @""; [ws toast:T(@"التطبيق ما تعرّف على الرابط (انسخت التفاصيل، الصقها لي)", @"The app didn\u2019t recognise the link (details copied)")]; return; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
+        // "accepted" only means the app took the call: the panel stays until a room screen really appears
+        __block int tries = 0;
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+            UIViewController *now = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
+            if (now && now != before) { [t invalidate]; [ws dismissViewControllerAnimated:YES completion:nil]; return; }
+            if (++tries >= 16) {
+                [t invalidate]; [gJoinLog appendString:@"result: no room screen appeared within 8s\n"];
+                UIPasteboard.generalPasteboard.string = gJoinLog ?: @"";
+                [ws toast:T(@"التطبيق قبل الرابط بس ما دخل الغرفة (انسخت التفاصيل، الصقها لي)", @"The app accepted the link but no room opened (details copied)")];
+            }
+        }];
     });
 }
 - (void)renderJoin {
