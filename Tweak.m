@@ -298,12 +298,19 @@ static NSArray<NSURL *> *RYCandidates(NSString *html) {
 static void RYTryNext(NSArray<NSURL *> *urls, NSInteger i, UIViewController *before, void (^done)(BOOL)) {
     if (i >= (NSInteger)urls.count || i >= 8) { done(NO); return; }
     NSURL *cu = urls[i];
-    RYDeliverURL(cu); // the return value is not trusted: the room screen is the only proof
+    BOOL accepted = RYDeliverURL(cu); // accepted != joined: the room screen is the only proof
+    int limit = accepted ? 50 : 4;    // 15s when the app accepted the link, ~1s otherwise
     __block int tries = 0;
     [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) {
         UIViewController *now = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
         if (now && now != before) { [t invalidate]; [gJoinLog appendFormat:@"entered a room after: %@\n", cu]; done(YES); return; }
-        if (++tries >= 10) { [t invalidate]; [gJoinLog appendString:@" no room after 3s, next\n"]; RYTryNext(urls, i + 1, before, done); }
+        if (++tries >= limit) {
+            [t invalidate];
+            if (accepted) { // stop here (no double joins) and record what the app is showing
+                NSMutableString *o = [NSMutableString new]; for (UIWindow *w in RYAppWindows()) RYDump(w.rootViewController, 0, o);
+                [gJoinLog appendFormat:@" accepted but no room after 15s. screens now:\n%@", o]; done(NO);
+            } else { [gJoinLog appendString:@" refused, next\n"]; RYTryNext(urls, i + 1, before, done); }
+        }
     }];
 }
 static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
@@ -347,6 +354,15 @@ static BOOL gKeepOn = YES;
 @implementation RYKeep
 + (instancetype)shared { static RYKeep *k; static dispatch_once_t o; dispatch_once(&o, ^{ k = [RYKeep new]; }); return k; }
 static BOOL RYHasBgMode(NSString *m) { return [[NSBundle.mainBundle objectForInfoDictionaryKey:@"UIBackgroundModes"] containsObject:m]; }
+- (void)hud:(NSString *)s {
+    UIView *host = self.win.rootViewController.view; if (!host) return;
+    UILabel *l = RYLabel(s, 14, UIFontWeightMedium, nil); l.textAlignment = NSTextAlignmentCenter; l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
+    l.layer.cornerRadius = 12; l.clipsToBounds = YES; l.userInteractionEnabled = NO;
+    CGSize z = [l sizeThatFits:CGSizeMake(host.bounds.size.width - 60, CGFLOAT_MAX)];
+    l.frame = CGRectMake(0, 0, z.width + 28, z.height + 18); l.center = CGPointMake(host.bounds.size.width / 2, host.bounds.size.height - 110);
+    [host addSubview:l];
+    [UIView animateWithDuration:0.4 delay:4 options:0 animations:^{ l.alpha = 0; } completion:^(BOOL f) { [l removeFromSuperview]; }];
+}
 - (void)start {
     if (self.lm) { CLAuthorizationStatus a = self.lm.authorizationStatus; if (a == kCLAuthorizationStatusAuthorizedWhenInUse || a == kCLAuthorizationStatusAuthorizedAlways) [self.lm startUpdatingLocation]; return; }
     CLLocationManager *m = [CLLocationManager new]; m.delegate = self;
@@ -737,6 +753,7 @@ static NSString *RYReport(void) {
 @property (nonatomic, strong) UIColor *origBg;
 @property (nonatomic) NSInteger stamp;
 + (instancetype)shared;
+- (void)hud:(NSString *)s;
 - (void)start; - (void)openPanel; - (void)panelClosed; - (void)bump;
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger code))done;
 // one-shot invite pass over the visible list (Recents / Friends screen)
@@ -1005,12 +1022,18 @@ static void RYMsgLoopSet(BOOL on) {
     NSURL *u = RYParseRoomURL(str);
     if (!u) { [self toast:T(@"ما لقيت رابط", @"No link found")]; return; }
     [self toast:T(@"جاري الدخول...", @"Joining...")];
-    [ws toast:T(@"جاري المحاولة…", @"Trying…")];
-    RYJoinLink(u, ^(BOOL ok) {
-        if (ok) { [ws dismissViewControllerAnimated:YES completion:nil]; return; }
-        UIPasteboard.generalPasteboard.string = gJoinLog ?: @"";
-        [ws toast:T(@"ما دخل الغرفة (انسخت التفاصيل، الصقها لي)", @"Could not enter the room (details copied)")];
-    });
+    // the overlay window is key while the panel is open and the app may present from the key window: close the panel first
+    [ws dismissViewControllerAnimated:YES completion:^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIWindow *k = [RYCore shared].prevKey ?: RYAppWindows().firstObject; [k makeKeyWindow];
+            [[RYCore shared] hud:T(@"جاري الدخول…", @"Joining…")];
+            RYJoinLink(u, ^(BOOL ok) {
+                if (ok) return;
+                UIPasteboard.generalPasteboard.string = gJoinLog ?: @"";
+                [[RYCore shared] hud:T(@"ما دخل الغرفة (انسخت التفاصيل، الصقها لي)", @"Could not enter the room (details copied)")];
+            });
+        });
+    }];
 }
 - (void)renderJoin {
     __weak typeof(self) ws = self;
