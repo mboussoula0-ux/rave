@@ -247,33 +247,25 @@ static BOOL RYDeliverURL(NSURL *u) {
     UIApplication *app = UIApplication.sharedApplication;
     BOOL web = [u.scheme.lowercaseString hasPrefix:@"http"];
     BOOL handled = NO;
-    [gJoinLog appendFormat:@"deliver: %@\n", u];
+    [gJoinLog appendFormat:@"deliver: %@ (app state %ld)\n", u, (long)app.applicationState];
     id ad = app.delegate;
     if (web) { // NSUserActivity.webpageURL accepts only http/https (anything else throws)
         NSUserActivity *act = [[NSUserActivity alloc] initWithActivityType:NSUserActivityTypeBrowsingWeb];
         act.webpageURL = u;
         for (UIScene *sc in app.connectedScenes) {
             id d = sc.delegate;
-            BOOL r = [d respondsToSelector:@selector(scene:continueUserActivity:)];
-            [gJoinLog appendFormat:@" scene %@ continue: %@\n", NSStringFromClass([d class]), r ? @"yes" : @"no"];
-            if (r) { [d scene:sc continueUserActivity:act]; handled = YES; }
+            if ([d respondsToSelector:@selector(scene:continueUserActivity:)]) { [d scene:sc continueUserActivity:act]; handled = YES; [gJoinLog appendString:@" scene continue called\n"]; }
         }
-        BOOL ra = [ad respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)];
-        [gJoinLog appendFormat:@" appdelegate continue: %@\n", ra ? @"yes" : @"no"];
-        if (!handled && ra) {
+        if (!handled && [ad respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)]) {
             handled = [ad application:app continueUserActivity:act restorationHandler:^(NSArray<id<UIUserActivityRestoring>> *x) {}];
-            [gJoinLog appendFormat:@"  -> returned %d\n", handled];
+            [gJoinLog appendFormat:@" appdelegate continue -> %d\n", handled];
         }
     }
-    BOOL ro = [ad respondsToSelector:@selector(application:openURL:options:)];
-    [gJoinLog appendFormat:@" appdelegate openURL: %@\n", ro ? @"yes" : @"no"];
-    if (!handled && ro) {
-        handled = [ad application:app openURL:u options:@{}];
-        [gJoinLog appendFormat:@"  -> returned %d\n", handled];
-    }
-    if (!handled && !web) { // custom scheme registered by the app itself: let iOS route it back to us
-        [app openURL:u options:@{} completionHandler:nil];
-        [gJoinLog appendString:@" UIApplication openURL fired\n"]; handled = YES;
+    // many handlers look at who opened the link, so say it came from Safari
+    NSDictionary *opts = @{UIApplicationOpenURLOptionsSourceApplicationKey: @"com.apple.mobilesafari", UIApplicationOpenURLOptionsOpenInPlaceKey: @NO};
+    if ([ad respondsToSelector:@selector(application:openURL:options:)]) {
+        BOOL r = [ad application:app openURL:u options:opts];
+        [gJoinLog appendFormat:@" appdelegate openURL -> %d\n", r]; handled = handled || r;
     }
     return handled;
 }
@@ -303,25 +295,44 @@ static NSArray<NSURL *> *RYCandidates(NSString *html) {
         return cp == cq ? NSOrderedSame : (cp ? NSOrderedAscending : NSOrderedDescending);
     }];
 }
+static void RYTryNext(NSArray<NSURL *> *urls, NSInteger i, UIViewController *before, void (^done)(BOOL)) {
+    if (i >= (NSInteger)urls.count || i >= 8) { done(NO); return; }
+    NSURL *cu = urls[i];
+    RYDeliverURL(cu); // the return value is not trusted: the room screen is the only proof
+    __block int tries = 0;
+    [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) {
+        UIViewController *now = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
+        if (now && now != before) { [t invalidate]; [gJoinLog appendFormat:@"entered a room after: %@\n", cu]; done(YES); return; }
+        if (++tries >= 10) { [t invalidate]; [gJoinLog appendString:@" no room after 3s, next\n"]; RYTryNext(urls, i + 1, before, done); }
+    }];
+}
 static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
     gJoinLog = [NSMutableString stringWithFormat:@"link: %@\n", u];
-    if (RYDeliverURL(u)) { done(YES); return; }
-    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 8;
-    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
-        NSURL *f = resp.URL;
-        NSInteger code = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
-        NSString *html = d.length ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [gJoinLog appendFormat:@"fetch: status=%ld error=%@ final=%@ bytes=%lu\n", (long)code, e.localizedDescription, f, (unsigned long)d.length];
-            BOOL ok = (f && ![f isEqual:u]) ? RYDeliverURL(f) : NO;
-            if (!ok && html) {
-                NSArray *c = RYCandidates(html); [gJoinLog appendFormat:@"candidates: %lu\n", (unsigned long)c.count];
-                int n = 0; for (NSURL *cu in c) { if (n++ >= 8) break; if (RYDeliverURL(cu)) { ok = YES; break; } }
-            }
-            if (!ok && html) [gJoinLog appendFormat:@"html:\n%@\n", html.length > 1800 ? [html substringToIndex:1800] : html];
-            done(ok);
-        });
-    }] resume];
+    UIViewController *before = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
+    RYTryNext(@[u], 0, before, ^(BOOL ok) {
+        if (ok) { done(YES); return; }
+        NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 8;
+        [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+            NSURL *f = resp.URL;
+            NSInteger code = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+            NSString *html = d.length ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [gJoinLog appendFormat:@"fetch: status=%ld error=%@ final=%@ bytes=%lu\n", (long)code, e.localizedDescription, f, (unsigned long)d.length];
+                NSMutableOrderedSet *urls = [NSMutableOrderedSet new];
+                if (f && ![f isEqual:u]) [urls addObject:f];
+                NSArray *c = RYCandidates(html);
+                [gJoinLog appendFormat:@"candidates: %lu\n", (unsigned long)c.count];
+                // the app registers both schemes; the id is the same, so try the short scheme too
+                for (NSURL *x in c) {
+                    [urls addObject:x];
+                    NSString *sx = x.absoluteString;
+                    if ([sx hasPrefix:@"sh.weme.wemesh://"]) { NSURL *y = [NSURL URLWithString:[@"wemesh://" stringByAppendingString:[sx substringFromIndex:17]]]; if (y) [urls addObject:y]; }
+                }
+                if (!urls.count && html) [gJoinLog appendFormat:@"html:\n%@\n", html.length > 1800 ? [html substringToIndex:1800] : html];
+                RYTryNext([urls array], 0, before, done);
+            });
+        }] resume];
+    });
 }
 
 #pragma mark - Anti-AFK (keep the process alive in the background)
@@ -994,20 +1005,11 @@ static void RYMsgLoopSet(BOOL on) {
     NSURL *u = RYParseRoomURL(str);
     if (!u) { [self toast:T(@"ما لقيت رابط", @"No link found")]; return; }
     [self toast:T(@"جاري الدخول...", @"Joining...")];
-    UIViewController *before = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
+    [ws toast:T(@"جاري المحاولة…", @"Trying…")];
     RYJoinLink(u, ^(BOOL ok) {
-        if (!ok) { UIPasteboard.generalPasteboard.string = gJoinLog ?: @""; [ws toast:T(@"التطبيق ما تعرّف على الرابط (انسخت التفاصيل، الصقها لي)", @"The app didn\u2019t recognise the link (details copied)")]; return; }
-        // "accepted" only means the app took the call: the panel stays until a room screen really appears
-        __block int tries = 0;
-        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-            UIViewController *now = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
-            if (now && now != before) { [t invalidate]; [ws dismissViewControllerAnimated:YES completion:nil]; return; }
-            if (++tries >= 16) {
-                [t invalidate]; [gJoinLog appendString:@"result: no room screen appeared within 8s\n"];
-                UIPasteboard.generalPasteboard.string = gJoinLog ?: @"";
-                [ws toast:T(@"التطبيق قبل الرابط بس ما دخل الغرفة (انسخت التفاصيل، الصقها لي)", @"The app accepted the link but no room opened (details copied)")];
-            }
-        }];
+        if (ok) { [ws dismissViewControllerAnimated:YES completion:nil]; return; }
+        UIPasteboard.generalPasteboard.string = gJoinLog ?: @"";
+        [ws toast:T(@"ما دخل الغرفة (انسخت التفاصيل، الصقها لي)", @"Could not enter the room (details copied)")];
     });
 }
 - (void)renderJoin {
