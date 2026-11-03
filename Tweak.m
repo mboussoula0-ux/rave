@@ -242,28 +242,45 @@ static NSURL *RYParseRoomURL(NSString *s) {
     return c.URL ?: u;
 }
 // calls the same entry points iOS would call for a tapped Universal Link
+static NSMutableString *gJoinLog;
 static BOOL RYDeliverURL(NSURL *u) {
     UIApplication *app = UIApplication.sharedApplication;
     NSUserActivity *act = [[NSUserActivity alloc] initWithActivityType:NSUserActivityTypeBrowsingWeb];
     act.webpageURL = u;
     BOOL handled = NO;
+    [gJoinLog appendFormat:@"deliver: %@\n", u];
     for (UIScene *sc in app.connectedScenes) {
         id d = sc.delegate;
-        if ([d respondsToSelector:@selector(scene:continueUserActivity:)]) { [d scene:sc continueUserActivity:act]; handled = YES; }
+        BOOL r = [d respondsToSelector:@selector(scene:continueUserActivity:)];
+        [gJoinLog appendFormat:@" scene %@ continue: %@\n", NSStringFromClass([d class]), r ? @"yes" : @"no"];
+        if (r) { [d scene:sc continueUserActivity:act]; handled = YES; }
     }
     id ad = app.delegate;
-    if (!handled && [ad respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)])
+    BOOL ra = [ad respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)];
+    [gJoinLog appendFormat:@" appdelegate %@ continue: %@\n", NSStringFromClass([ad class]), ra ? @"yes" : @"no"];
+    if (!handled && ra) {
         handled = [ad application:app continueUserActivity:act restorationHandler:^(NSArray<id<UIUserActivityRestoring>> *x) {}];
-    if (!handled && [ad respondsToSelector:@selector(application:openURL:options:)])
+        [gJoinLog appendFormat:@"  -> returned %d\n", handled];
+    }
+    BOOL ro = [ad respondsToSelector:@selector(application:openURL:options:)];
+    [gJoinLog appendFormat:@" appdelegate openURL: %@\n", ro ? @"yes" : @"no"];
+    if (!handled && ro) {
         handled = [ad application:app openURL:u options:@{}];
+        [gJoinLog appendFormat:@"  -> returned %d\n", handled];
+    }
     return handled;
 }
 static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
+    gJoinLog = [NSMutableString stringWithFormat:@"link: %@\n", u];
     if (RYDeliverURL(u)) { done(YES); return; }
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 8;
     [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
         NSURL *f = resp.URL;
-        dispatch_async(dispatch_get_main_queue(), ^{ done((f && ![f isEqual:u]) ? RYDeliverURL(f) : NO); });
+        NSInteger code = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [gJoinLog appendFormat:@"fetch: status=%ld error=%@ final=%@ bytes=%lu\n", (long)code, e.localizedDescription, f, (unsigned long)d.length];
+            done((f && ![f isEqual:u]) ? RYDeliverURL(f) : NO);
+        });
     }] resume];
 }
 
@@ -938,7 +955,7 @@ static void RYMsgLoopSet(BOOL on) {
     if (!u) { [self toast:T(@"ما لقيت رابط", @"No link found")]; return; }
     [self toast:T(@"جاري الدخول...", @"Joining...")];
     RYJoinLink(u, ^(BOOL ok) {
-        if (!ok) { [ws toast:T(@"التطبيق ما تعرّف على الرابط", @"The app didn't recognise the link")]; return; }
+        if (!ok) { UIPasteboard.generalPasteboard.string = gJoinLog ?: @""; [ws toast:T(@"التطبيق ما تعرّف على الرابط (انسخت التفاصيل، الصقها لي)", @"The app didn\u2019t recognise the link (details copied)")]; return; }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     });
 }
