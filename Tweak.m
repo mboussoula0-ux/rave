@@ -299,13 +299,15 @@ static void RYTryNext(NSArray<NSURL *> *urls, NSInteger i, UIViewController *bef
     if (i >= (NSInteger)urls.count || i >= 8) { done(NO); return; }
     NSURL *cu = urls[i];
     BOOL accepted = RYDeliverURL(cu); // accepted != joined: the room screen is the only proof
-    int limit = accepted ? 50 : 4;    // 15s when the app accepted the link, ~1s otherwise
+    BOOL wasInRoom = (before != nil);  // the room screen is reused when you switch rooms, so it cannot prove anything then
+    int limit = accepted ? (wasInRoom ? 20 : 50) : 4;    // accepted: 6s (already in a room) or 15s; refused: ~1s
     __block int tries = 0;
     [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) {
         UIViewController *now = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
         if (now && now != before) { [t invalidate]; [gJoinLog appendFormat:@"entered a room after: %@\n", cu]; done(YES); return; }
         if (++tries >= limit) {
             [t invalidate];
+            if (accepted && wasInRoom) { [gJoinLog appendString:@" accepted while already in a room: cannot verify\n"]; done(YES); return; }
             if (accepted) { // stop here (no double joins) and record what the app is showing
                 NSMutableString *o = [NSMutableString new]; for (UIWindow *w in RYAppWindows()) RYDump(w.rootViewController, 0, o);
                 [gJoinLog appendFormat:@" accepted but no room after 15s. screens now:\n%@", o]; done(NO);
@@ -825,7 +827,7 @@ static void RYMsgLoopSet(BOOL on) {
     __weak typeof(self) ws = self;
     self.view.backgroundColor = RY_BG; self.view.overrideUserInterfaceStyle = UIUserInterfaceStyleDark; self.view.semanticContentAttribute = RYSem();
 
-    UILabel *title = RYLabel(RYBrand(), 22, UIFontWeightHeavy, nil); title.numberOfLines = 1;
+    UILabel *title = RYLabel(@"8ubah", 22, UIFontWeightHeavy, nil); title.numberOfLines = 1;
     UIView *spacer = [UIView new]; [spacer setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
@@ -1019,7 +1021,7 @@ static void RYMsgLoopSet(BOOL on) {
             UIWindow *k = [RYCore shared].prevKey ?: RYAppWindows().firstObject; [k makeKeyWindow];
             [[RYCore shared] hud:T(@"جاري الدخول…", @"Joining…")];
             RYJoinLink(u, ^(BOOL ok) {
-                if (ok) return;
+                if (ok) { if ([gJoinLog containsString:@"cannot verify"]) [[RYCore shared] hud:T(@"انرسل الرابط للتطبيق (ما أقدر أتأكد وأنت داخل غرفة)", @"Link sent to the app (cannot verify while inside a room)")]; return; }
                 UIPasteboard.generalPasteboard.string = gJoinLog ?: @"";
                 [[RYCore shared] hud:T(@"ما دخل الغرفة (انسخت التفاصيل، الصقها لي)", @"Could not enter the room (details copied)")];
             });
@@ -1082,7 +1084,7 @@ static void RYMsgLoopSet(BOOL on) {
         RYBtn(T(@"نسخ أسماء الصور بالشاشة", @"Copy on-screen image names"), NO, ^{ UIPasteboard.generalPasteboard.string = RYImageReport(); [ws toast:T(@"اننسخت", @"Copied")]; }),
         RYBtn(T(@"نسخ تقرير تشخيصي", @"Copy diagnostic report"), YES, ^{ UIPasteboard.generalPasteboard.string = RYReport(); [ws toast:T(@"اننسخ التقرير", @"Report copied")]; }),
         RYBtn([NSString stringWithFormat:T(@"اسم العلامة: %@", @"Brand name: %@"), RYBrand()], NO, ^{
-            [ws ask:T(@"الاسم اللي يظهر بدل rave", @"Name shown instead of rave") ph:@"Layan" secure:NO ok:^(NSString *x) { CS(@"brandName", x.length ? x : nil); [ws rebuild]; }];
+            [ws ask:T(@"الاسم اللي يظهر بدل rave", @"Name shown instead of rave") ph:@"Layan" secure:NO ok:^(NSString *x) { CS(@"brandName", x.length ? x : nil); CS(@"brandOn", @(x.length > 0)); [ws rebuild]; }];
         }),
         RYBtn([NSString stringWithFormat:T(@"اسم شاشة الغرفة: %@", @"Room screen class: %@"), CF(@"roomClass", RY_ROOM_DEFAULT)], NO, ^{
             [ws ask:T(@"اسم الكلاس", @"Class name") ph:RY_ROOM_DEFAULT secure:NO ok:^(NSString *s) { CS(@"roomClass", s.length ? s : nil); [ws rebuild]; }];
@@ -1250,7 +1252,7 @@ static void RYActivateCtl(id b) {
     self.wasIn = in;
     [self syncBG:room];
     static int brandTick = 0; brandTick++;
-    NSString *pat = (brandTick % 5 == 1) ? CF(@"brand", RY_BRAND_TOKENS) : @""; // logo walk only every ~4s: keeps the main thread free
+    NSString *pat = ([CF(@"brandOn", @NO) boolValue] && brandTick % 5 == 1) ? CF(@"brand", RY_BRAND_TOKENS) : @""; // logo walk only every ~4s: keeps the main thread free
     if (pat.length) {
         NSMutableArray *toks = [NSMutableArray new];
         for (NSString *t in [pat.lowercaseString componentsSeparatedByString:@","]) { NSString *x = [t stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]; if (x.length) [toks addObject:x]; }
