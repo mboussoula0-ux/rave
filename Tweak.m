@@ -1,4 +1,4 @@
-// Melo — local feature set (injected dylib) (injected dylib)
+// Layan — local feature set (injected dylib) (injected dylib)
 // Pure Objective-C runtime: no Substrate / no Logos, so it works with Feather / ESign / Sideloadly injection.
 // UNTESTED on a device: class names are tunable from Settings > Advanced.
 
@@ -481,8 +481,8 @@ static void RYSetKeep(BOOL on) { gKeepOn = on; CS(@"keepOn", @(on)); if (on) [[R
 #pragma mark - Branding
 
 static NSString *RYBrand(void) {
-    NSString *s = CF(@"brandName", @"Melo");
-    return ([s isKindOfClass:NSString.class] && s.length) ? s : @"Melo";
+    NSString *s = CF(@"brandName", @"Layan");
+    return ([s isKindOfClass:NSString.class] && s.length) ? s : @"Layan";
 }
 static NSString *RYImgName(UIImage *im) {
     if (!im) return @"";
@@ -1216,7 +1216,7 @@ static void RYMsgLoopSet(BOOL on) {
         RYBtn(T(@"نسخ أسماء الصور بالشاشة", @"Copy on-screen image names"), NO, ^{ UIPasteboard.generalPasteboard.string = RYImageReport(); [ws toast:T(@"اننسخت", @"Copied")]; }),
         RYBtn(T(@"نسخ تقرير تشخيصي", @"Copy diagnostic report"), YES, ^{ UIPasteboard.generalPasteboard.string = RYReport(); [ws toast:T(@"اننسخ التقرير", @"Report copied")]; }),
         RYBtn([NSString stringWithFormat:T(@"اسم العلامة: %@", @"Brand name: %@"), RYBrand()], NO, ^{
-            [ws ask:T(@"الاسم اللي يظهر بدل rave", @"Name shown instead of rave") ph:@"Melo" secure:NO ok:^(NSString *x) { CS(@"brandName", x.length ? x : nil); CS(@"brandOn", @(x.length > 0)); [ws rebuild]; }];
+            [ws ask:T(@"الاسم اللي يظهر بدل rave", @"Name shown instead of rave") ph:@"Layan" secure:NO ok:^(NSString *x) { CS(@"brandName", x.length ? x : nil); CS(@"brandOn", @(x.length > 0)); [ws rebuild]; }];
         }),
         RYBtn([NSString stringWithFormat:T(@"اسم شاشة الغرفة: %@", @"Room screen class: %@"), CF(@"roomClass", RY_ROOM_DEFAULT)], NO, ^{
             [ws ask:T(@"اسم الكلاس", @"Class name") ph:RY_ROOM_DEFAULT secure:NO ok:^(NSString *s) { CS(@"roomClass", s.length ? s : nil); [ws rebuild]; }];
