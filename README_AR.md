@@ -1,17 +1,19 @@
-# Melo — تعديل ريف
+# Layan — تعديل ريف
 
 ## الملفات
-- `Tweak.m` الكود، `Makefile`، `.github/workflows/build.yml` (يبني `Melo.dylib` على GitHub)
+- `Tweak.m` الكود، `Makefile`، `.github/workflows/build.yml` (يبني `Layan.dylib` على GitHub)
 - `tools/patch_ipa.py` يغيّر اسم التطبيق تحت الأيقونة + الأيقونة (يشتغل على مجلد Rave.app المفكوك)
-- `icons/` أيقونات Melo الجاهزة
+- `icons/` أيقونات Layan الجاهزة
 
 ## الخطوات
-1. ارفع كل الملفات للريبو (مع `.github`)، شغّل Actions ← Build Melo، نزّل `Melo-dylib`.
-2. فك الـ IPA، ثم: `python3 tools/patch_ipa.py Payload/Rave.app` (الاسم + الأيقونة).
-3. أعد الضغط كـ IPA، وحقن `Melo.dylib` بـ Feather/ESign/Sideloadly ووقّع.
+1. ارفع كل الملفات للريبو (مع `.github`)، شغّل Actions ← Build Layan، نزّل `Layan-dylib`.
+2. شغّل الأداة (تفك الـ IPA وتعدل الاسم والأيقونة وتحط الدايلب وتعيد الضغط صح):
+   `python3 tools/build_ipa.py Rave.ipa Layan.dylib Layan.ipa`
+   مهم: استخدم IPA ريف الأصلي النظيف دايمًا، مو IPA معدّل سابقًا.
+3. ثبّت `Layan.ipa` بـ Sideloadly بدون ما تفعّل خيار حقن dylib (الحقن صار داخل الـ IPA).
 
 ## ملاحظات
-- لوقو الواجهة (35x25 فوق) يتبدل بالكود وقت التشغيل إلى نص Melo.
+- لوقو الواجهة (35x25 فوق) يتبدل بالكود وقت التشغيل إلى نص Layan.
 - لوقو شاشة الإقلاع (LaunchScreen) داخل storyboard ما يتغير بالـ dylib.
 - الدعوات: يحدد الدايرة لكل شخص بسرعة (عدة شاشات بالثانية) ثم يضغط زر الإرسال بعد آخر واحد. لو ما اشتغل ينسخ تفاصيل الصفوف، أرسلها لي.
 - اختصار الروابط: زر "اختصار" في تبويب دخول برابط: اسم + رابط، ينحفظ ويطلع كزر دايم (يدخر في إعدادات التطبيق ويدخل ضمن التصدير/الاستيراد).
