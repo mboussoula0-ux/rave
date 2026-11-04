@@ -848,89 +848,6 @@ static NSString *RYReport(void) {
 @property (nonatomic) BOOL invRunning;
 @property (nonatomic) NSInteger invSent;
 @property (nonatomic, copy) NSString *invStatus;
-- (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft { if (!gInvLast) return 0; NSInteger l = (NSInteger)(240 - ([NSDate date].timeIntervalSince1970 - gInvLast)); return l > 0 ? l : 0; }
-- (void)stopInvites {
-    [gInvTimer invalidate]; gInvTimer = nil;
-    if (self.invRunning) { self.invRunning = NO; if (gInvOK > 0) gInvLast = [NSDate date].timeIntervalSince1970; self.invStatus = [NSString stringWithFormat:T(@"وقف. حُدّد %ld.", @"Stopped. %ld selected."), (long)self.invSent]; }
-}
-- (void)startInvites {
-    if (self.invRunning || [self invCooldownLeft] > 0) return;
-    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
-    gInvPend = NO; gInvSending = NO; gInvFinalSend = NO; gInvDumped = NO; gInvFail = 0; gInvSelected = 0; gInvMethod = -1; gInvPendCell = nil;
-    gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.9 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
-}
-- (void)invFinish:(NSString *)why {
-    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = [NSDate date].timeIntervalSince1970;
-    self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
-    if (gInvOK == 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما تحدد أحد، انسخت التفاصيل", @" - nothing got selected, details copied")]; }
-}
-// press "Send N invites"; final = the list is finished
-- (void)invPressSend:(BOOL)final {
-    NSInteger c = 0; UIView *b = RYFindSendBtn(&c);
-    BOOL ok = b ? RYTapAncestors(b) : NO;
-    [gInvLog appendFormat:@"send button %@ (%ld selected) pressed=%d\n", b ? NSStringFromClass(b.class) : @"NOT FOUND", (long)c, ok];
-    if (!ok) {
-        UIPasteboard.generalPasteboard.string = gInvLog;
-        [self invFinish:T(@"ما قدرت أضغط زر الإرسال (انسخت التفاصيل). المحدد:", @"Could not press the send button (details copied). Selected:")];
-        return;
-    }
-    self.invStatus = [NSString stringWithFormat:T(@"ضغط إرسال (%ld)", @"Pressed send (%ld)"), (long)c];
-    gInvSending = YES; gInvSendWait = 3; gInvFinalSend = final; gInvPend = NO; gInvSelected = 0; gInvFail = 0;
-}
-- (void)invStep {
-    if (gInvSending) { // the app is busy sending: wait, then carry on (or end)
-        if (--gInvSendWait > 0) return;
-        gInvSending = NO;
-        if (gInvFinalSend) { [self invFinish:T(@"خلصت وانرسلت الدعوات. المحدد:", @"Done, invites sent. Selected:")]; return; }
-    }
-    UIScrollView *sv = RYBiggestList();
-    if (!sv) { if (++gInvIdle > 6) [self invFinish:T(@"ما لقيت قائمة بالشاشة. المحدد:", @"No list on screen. Selected:")]; return; }
-    if (gInvPend) { // did the last tap move the "Send N" counter?
-        NSInteger c = RYSendCountNow(); UIView *pc = gInvPendCell;
-        if (c > gInvPendBefore) {
-            gInvPend = NO; gInvSelected = c; self.invSent++; gInvOK++; gInvFail = 0; gInvMethod = gInvPendMethod;
-            [gInvLog appendFormat:@"  ticked (method %ld), counter=%ld\n", (long)gInvPendMethod, (long)c];
-        } else if (++gInvPendTicks < 2) { return; }
-        else {
-            NSInteger m = gInvPendMethod + 1; BOOL again = NO;
-            while (pc && m <= 3) { if (RYSelectRow(sv, pc, m)) { gInvPendMethod = m; gInvPendTicks = 0; again = YES; break; } m++; }
-            if (again) { [gInvLog appendFormat:@"  no change, trying method %ld\n", (long)m]; return; }
-            gInvPend = NO; gInvFail++; [gInvLog appendString:@"  row could not be ticked\n"];
-            if (!gInvDumped && pc) { gInvDumped = YES; RYRowDump(pc); }
-        }
-    }
-    if (gInvFail >= 3) { // three rows in a row refused: either a selection limit (send what we have) or the tap does not reach the circle
-        if (gInvSelected > 0) { [self invPressSend:NO]; return; }
-        [self invFinish:T(@"ما قدرت أحدد الدايرة. المحدد:", @"Could not tick the circle. Selected:")]; return;
-    }
-    for (UIView *cell in RYVisibleCells(sv)) {
-        NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
-        if (!key.length) [key appendFormat:@"%p", cell];
-        if ([gInvDone containsObject:key]) continue;
-        [gInvDone addObject:key];
-        gInvPendBefore = RYSendCountNow(); gInvPendCell = cell; gInvPendTicks = 0;
-        BOOL started = NO;
-        for (NSInteger m = (gInvMethod >= 0 ? gInvMethod : 0); m <= 3; m++) if (RYSelectRow(sv, cell, m)) { gInvPendMethod = m; started = YES; break; }
-        [gInvLog appendFormat:@"row %@ method=%ld started=%d\n", RYClip(key, 30), (long)gInvPendMethod, started];
-        if (!started) { gInvFail++; if (!gInvDumped) { gInvDumped = YES; RYRowDump(cell); } continue; }
-        gInvPend = YES; gInvIdle = 0;
-        self.invStatus = [NSString stringWithFormat:T(@"أحدد: %@", @"Selecting: %@"), RYClip(key, 24)];
-        return;
-    }
-    // nothing new on this screenful: scroll one page; at the end press "Send"
-    CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
-    if (sv.contentOffset.y >= maxY - 2) {
-        if (++gInvIdle >= 2) { if (gInvSelected > 0) [self invPressSend:YES]; else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")]; }
-        return;
-    }
-    [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
-    gInvIdle = 0;
-}
-- (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger code))done;
-// one-shot invite pass over the visible list (Recents / Friends screen)
-@property (nonatomic) BOOL invRunning;
-@property (nonatomic) NSInteger invSent;
-@property (nonatomic, copy) NSString *invStatus;
 - (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft;
 @end
 
@@ -1586,32 +1503,78 @@ static void RYRowDump(UIView *cell) {
 - (NSInteger)invCooldownLeft { if (!gInvLast) return 0; NSInteger l = (NSInteger)(240 - ([NSDate date].timeIntervalSince1970 - gInvLast)); return l > 0 ? l : 0; }
 - (void)stopInvites {
     [gInvTimer invalidate]; gInvTimer = nil;
-    if (self.invRunning) { self.invRunning = NO; gInvLast = [NSDate date].timeIntervalSince1970; self.invStatus = [NSString stringWithFormat:T(@"وقف. انرسل %ld دعوة.", @"Stopped. %ld invites sent."), (long)self.invSent]; }
+    if (self.invRunning) { self.invRunning = NO; if (gInvOK > 0) gInvLast = [NSDate date].timeIntervalSince1970; self.invStatus = [NSString stringWithFormat:T(@"وقف. حُدّد %ld.", @"Stopped. %ld selected."), (long)self.invSent]; }
 }
 - (void)startInvites {
     if (self.invRunning || [self invCooldownLeft] > 0) return;
     gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
+    gInvPend = NO; gInvSending = NO; gInvFinalSend = NO; gInvDumped = NO; gInvFail = 0; gInvSelected = 0; gInvMethod = -1; gInvPendCell = nil;
     gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.9 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
 }
 - (void)invFinish:(NSString *)why {
-    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; gInvLast = [NSDate date].timeIntervalSince1970;
-    self.invStatus = [NSString stringWithFormat:@"%@ %ld (%@ %ld)", why, (long)self.invSent, T(@"مؤكد", @"confirmed"), (long)gInvOK];
-    if (gInvOK == 0 && self.invSent > 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما تأكد أي إرسال، انسخت التفاصيل", @" - none confirmed, details copied")]; }
+    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = [NSDate date].timeIntervalSince1970;
+    self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
+    if (gInvOK == 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما تحدد أحد، انسخت التفاصيل", @" - nothing got selected, details copied")]; }
+}
+// press "Send N invites"; final = the list is finished
+- (void)invPressSend:(BOOL)final {
+    NSInteger c = 0; UIView *b = RYFindSendBtn(&c);
+    BOOL ok = b ? RYTapAncestors(b) : NO;
+    [gInvLog appendFormat:@"send button %@ (%ld selected) pressed=%d\n", b ? NSStringFromClass(b.class) : @"NOT FOUND", (long)c, ok];
+    if (!ok) {
+        UIPasteboard.generalPasteboard.string = gInvLog;
+        [self invFinish:T(@"ما قدرت أضغط زر الإرسال (انسخت التفاصيل). المحدد:", @"Could not press the send button (details copied). Selected:")];
+        return;
+    }
+    self.invStatus = [NSString stringWithFormat:T(@"ضغط إرسال (%ld)", @"Pressed send (%ld)"), (long)c];
+    gInvSending = YES; gInvSendWait = 3; gInvFinalSend = final; gInvPend = NO; gInvSelected = 0; gInvFail = 0;
 }
 - (void)invStep {
+    if (gInvSending) { // the app is busy sending: wait, then carry on (or end)
+        if (--gInvSendWait > 0) return;
+        gInvSending = NO;
+        if (gInvFinalSend) { [self invFinish:T(@"خلصت وانرسلت الدعوات. المحدد:", @"Done, invites sent. Selected:")]; return; }
+    }
     UIScrollView *sv = RYBiggestList();
-    if (!sv) { if (++gInvIdle > 6) [self invFinish:T(@"ما لقيت قائمة بالشاشة. انرسل:", @"No list on screen. Sent:")]; return; }
+    if (!sv) { if (++gInvIdle > 6) [self invFinish:T(@"ما لقيت قائمة بالشاشة. المحدد:", @"No list on screen. Selected:")]; return; }
+    if (gInvPend) { // did the last tap move the "Send N" counter?
+        NSInteger c = RYSendCountNow(); UIView *pc = gInvPendCell;
+        if (c > gInvPendBefore) {
+            gInvPend = NO; gInvSelected = c; self.invSent++; gInvOK++; gInvFail = 0; gInvMethod = gInvPendMethod;
+            [gInvLog appendFormat:@"  ticked (method %ld), counter=%ld\n", (long)gInvPendMethod, (long)c];
+        } else if (++gInvPendTicks < 2) { return; }
+        else {
+            NSInteger m = gInvPendMethod + 1; BOOL again = NO;
+            while (pc && m <= 3) { if (RYSelectRow(sv, pc, m)) { gInvPendMethod = m; gInvPendTicks = 0; again = YES; break; } m++; }
+            if (again) { [gInvLog appendFormat:@"  no change, trying method %ld\n", (long)m]; return; }
+            gInvPend = NO; gInvFail++; [gInvLog appendString:@"  row could not be ticked\n"];
+            if (!gInvDumped && pc) { gInvDumped = YES; RYRowDump(pc); }
+        }
+    }
+    if (gInvFail >= 3) { // three rows in a row refused: either a selection limit (send what we have) or the tap does not reach the circle
+        if (gInvSelected > 0) { [self invPressSend:NO]; return; }
+        [self invFinish:T(@"ما قدرت أحدد الدايرة. المحدد:", @"Could not tick the circle. Selected:")]; return;
+    }
     for (UIView *cell in RYVisibleCells(sv)) {
         NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
         if (!key.length) [key appendFormat:@"%p", cell];
         if ([gInvDone containsObject:key]) continue;
-        id b = RYInviteCtl(cell);
         [gInvDone addObject:key];
-        if (b) { RYActivateCtl(b); self.invSent++; self.invStatus = [NSString stringWithFormat:T(@"آخر واحد: %@", @"Last: %@"), RYClip(key, 24)]; gInvIdle = 0; return; }
+        gInvPendBefore = RYSendCountNow(); gInvPendCell = cell; gInvPendTicks = 0;
+        BOOL started = NO;
+        for (NSInteger m = (gInvMethod >= 0 ? gInvMethod : 0); m <= 3; m++) if (RYSelectRow(sv, cell, m)) { gInvPendMethod = m; started = YES; break; }
+        [gInvLog appendFormat:@"row %@ method=%ld started=%d\n", RYClip(key, 30), (long)gInvPendMethod, started];
+        if (!started) { gInvFail++; if (!gInvDumped) { gInvDumped = YES; RYRowDump(cell); } continue; }
+        gInvPend = YES; gInvIdle = 0;
+        self.invStatus = [NSString stringWithFormat:T(@"أحدد: %@", @"Selecting: %@"), RYClip(key, 24)];
+        return;
     }
-    // nothing new on this screenful: scroll one page; stop after two failed scrolls at the end
+    // nothing new on this screenful: scroll one page; at the end press "Send"
     CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
-    if (sv.contentOffset.y >= maxY - 2) { if (++gInvIdle >= 2) [self invFinish:T(@"خلصت القائمة. انرسل:", @"Reached the end. Sent:")]; return; }
+    if (sv.contentOffset.y >= maxY - 2) {
+        if (++gInvIdle >= 2) { if (gInvSelected > 0) [self invPressSend:YES]; else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")]; }
+        return;
+    }
     [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
     gInvIdle = 0;
 }
