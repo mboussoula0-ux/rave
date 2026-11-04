@@ -241,13 +241,36 @@ static NSURL *RYParseRoomURL(NSString *s) {
     if ([c.scheme isEqualToString:@"http"]) c.scheme = @"https";
     return c.URL ?: u;
 }
-// calls the same entry points iOS would call for a tapped Universal Link
+// calls the same entry points iOS would call for a tapped link.
+// "direct"  = we call the app delegate ourselves (only reaches app-delegate handlers)
+// "system"  = we ask iOS to open the app's own custom-scheme URL, so iOS picks the real entry point
+//             (application:openURL: or scene:openURLContexts:, whichever this app really uses)
+typedef NS_ENUM(NSInteger, RYVia) { RYViaDirect = 0, RYViaSystem = 1, RYViaActivity = 2 };
+static NSString *RYMeshID(NSURL *u) {
+    NSURLComponents *c = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO];
+    for (NSURLQueryItem *q in c.queryItems) if ([q.name.lowercaseString isEqualToString:@"mesh_id"] || [q.name.lowercaseString isEqualToString:@"meshid"]) return q.value;
+    NSString *l = u.path.lastPathComponent; return l.length >= 6 ? l : nil;
+}
 static NSMutableString *gJoinLog;
-static BOOL RYDeliverURL(NSURL *u) {
+static void RYDeliverURL(NSURL *u, RYVia via, void (^res)(BOOL accepted)) {
     UIApplication *app = UIApplication.sharedApplication;
     BOOL web = [u.scheme.lowercaseString hasPrefix:@"http"];
+    [gJoinLog appendFormat:@"deliver[%@]: %@ (app state %ld)\n", via == RYViaSystem ? @"system" : via == RYViaActivity ? @"handoff" : @"direct", u, (long)app.applicationState];
+    if (via == RYViaActivity) { // the plist lists a Handoff type for rooms: com.sh.weme.wemesh.mesh
+        NSString *mid = RYMeshID(u); id ad0 = app.delegate;
+        if (!mid || ![ad0 respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)]) { res(NO); return; }
+        NSUserActivity *act = [[NSUserActivity alloc] initWithActivityType:@"com.sh.weme.wemesh.mesh"];
+        [act addUserInfoEntriesFromDictionary:@{@"mesh_id": mid, @"meshId": mid, @"id": mid}];
+        BOOL r = [ad0 application:app continueUserActivity:act restorationHandler:^(NSArray<id<UIUserActivityRestoring>> *x) {}];
+        [gJoinLog appendFormat:@" handoff activity continue -> %d\n", r]; res(r); return;
+    }
+    if (via == RYViaSystem) {
+        [app openURL:u options:@{} completionHandler:^(BOOL ok) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [gJoinLog appendFormat:@" system open -> %d\n", ok]; res(ok); });
+        }];
+        return;
+    }
     BOOL handled = NO;
-    [gJoinLog appendFormat:@"deliver: %@ (app state %ld)\n", u, (long)app.applicationState];
     id ad = app.delegate;
     if (web) { // NSUserActivity.webpageURL accepts only http/https (anything else throws)
         NSUserActivity *act = [[NSUserActivity alloc] initWithActivityType:NSUserActivityTypeBrowsingWeb];
@@ -267,7 +290,7 @@ static BOOL RYDeliverURL(NSURL *u) {
         BOOL r = [ad application:app openURL:u options:opts];
         [gJoinLog appendFormat:@" appdelegate openURL -> %d\n", r]; handled = handled || r;
     }
-    return handled;
+    res(handled);
 }
 // the landing page of a short link usually contains the real deep link: collect every URL in it, app schemes first
 static NSArray<NSURL *> *RYCandidates(NSString *html) {
@@ -275,7 +298,7 @@ static NSArray<NSURL *> *RYCandidates(NSString *html) {
     html = [html stringByReplacingOccurrencesOfString:@"\\/" withString:@"/"];
     html = [html stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
     NSMutableOrderedSet *out = [NSMutableOrderedSet new];
-    NSArray *noise = @[@"apple.com", @"google", @"gstatic", @"w3.org", @"facebook", @"twitter", @"fonts.", @"schema.org", @"cloudflare", @"jsdelivr", @"cdnjs", @"itunes"];
+    NSArray *noise = @[@"apple.com", @"google", @"gstatic", @"w3.org", @"facebook", @"twitter", @"fonts.", @"schema.org", @"cloudflare", @"jsdelivr", @"cdnjs", @"itunes", @"ytimg", @"youtube"];
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[A-Za-z][A-Za-z0-9+.\\-]*://[^\\s\"'<>\\\\)]+" options:0 error:nil];
     for (NSTextCheckingResult *m in [re matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
         NSString *x = [[html substringWithRange:m.range] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@".,;"]];
@@ -288,37 +311,102 @@ static NSArray<NSURL *> *RYCandidates(NSString *html) {
     if (mm) {
         NSString *id_ = [html substringWithRange:[mm rangeAtIndex:1]];
         [gJoinLog appendFormat:@"mesh id in page: %@\n", id_];
-        NSURL *g = [NSURL URLWithString:[@"wemesh://mesh/" stringByAppendingString:id_]]; if (g) [out addObject:g];
+        // we do not know which shape the app parses, so offer every known one (each is tried and verified in turn)
+        for (NSString *f in @[@"wemesh://mesh?mesh_id={id}", @"wemesh://mesh/{id}", @"sh.weme.wemesh://mesh?mesh_id={id}", @"sh.weme.wemesh://mesh/{id}"]) {
+            NSURL *g = [NSURL URLWithString:[f stringByReplacingOccurrencesOfString:@"{id}" withString:id_]]; if (g) [out addObject:g];
+        }
     }
     return [[out array] sortedArrayWithOptions:NSSortStable usingComparator:^NSComparisonResult(NSURL *p, NSURL *q) {
         BOOL cp = ![p.scheme.lowercaseString hasPrefix:@"http"], cq = ![q.scheme.lowercaseString hasPrefix:@"http"];
         return cp == cq ? NSOrderedSame : (cp ? NSOrderedAscending : NSOrderedDescending);
     }];
 }
-static void RYTryNext(NSArray<NSURL *> *urls, NSInteger i, UIViewController *before, void (^done)(BOOL)) {
-    if (i >= (NSInteger)urls.count || i >= 8) { done(NO); return; }
-    NSURL *cu = urls[i];
-    BOOL accepted = RYDeliverURL(cu); // accepted != joined: the room screen is the only proof
+// one attempt = (url, how to deliver it)
+static NSArray<NSDictionary *> *RYAttempts(NSArray<NSURL *> *urls) {
+    NSMutableArray *a = [NSMutableArray new]; BOOL act = NO;
+    for (NSURL *x in urls) {
+        if ([x.scheme.lowercaseString hasPrefix:@"http"]) { [a addObject:@{@"u": x, @"via": @(RYViaDirect)}]; continue; }
+        [a addObject:@{@"u": x, @"via": @(RYViaSystem)}];
+        [a addObject:@{@"u": x, @"via": @(RYViaDirect)}];
+        if (!act && RYMeshID(x)) { act = YES; [a addObject:@{@"u": x, @"via": @(RYViaActivity)}]; }
+    }
+    return a;
+}
+static NSSet<NSString *> *RYScreenSet(void) {
+    NSMutableString *o = [NSMutableString new];
+    for (UIWindow *w in RYAppWindows()) RYDump(w.rootViewController, 0, o);
+    NSMutableSet *s = [NSMutableSet new];
+    for (NSString *ln in [o componentsSeparatedByString:@"\n"]) {
+        NSString *t = [ln stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (t.length) [s addObject:t];
+    }
+    return s;
+}
+// what the app exposes for links: written to the log only when everything failed, so it can be sent back for analysis
+static void RYListMethods(Class c, NSMutableString *o) {
+    if (!c) return;
+    unsigned n = 0; Method *ms = class_copyMethodList(c, &n);
+    for (unsigned i = 0; i < n; i++) {
+        NSString *s = NSStringFromSelector(method_getName(ms[i])), *l = s.lowercaseString;
+        for (NSString *k in @[@"url", @"link", @"activity", @"open", @"branch", @"deep", @"route"]) if ([l containsString:k]) { [o appendFormat:@"  - %@\n", s]; break; }
+    }
+    free(ms);
+}
+static void RYJoinDiag(void) {
+    UIApplication *app = UIApplication.sharedApplication; id ad = app.delegate;
+    NSMutableString *o = [NSMutableString stringWithString:@"\n-- diag --\n"];
+    [o appendFormat:@"bundle id: %@\n", NSBundle.mainBundle.bundleIdentifier];
+    [o appendFormat:@"app delegate: %@\n", NSStringFromClass([ad class])];
+    for (NSDictionary *t in ([NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleURLTypes"] ?: @[])) [o appendFormat:@"url schemes: %@\n", [t[@"CFBundleURLSchemes"] componentsJoinedByString:@","]];
+    [o appendFormat:@"Branch SDK class: %@\n", NSClassFromString(@"Branch") ? @"yes" : @"no"];
+    [o appendString:@"app delegate methods:\n"]; RYListMethods([ad class], o);
+    for (UIScene *sc in app.connectedScenes) {
+        [o appendFormat:@"scene: %@ delegate: %@\n", NSStringFromClass(sc.class), sc.delegate ? NSStringFromClass([(id)sc.delegate class]) : @"nil"];
+        if (sc.delegate) RYListMethods([(id)sc.delegate class], o);
+    }
+    const char *img = class_getImageName([ad class]);
+    if (img) {
+        unsigned cn = 0; const char **names = objc_copyClassNamesForImage(img, &cn); int shown = 0;
+        [o appendString:@"app classes about links:\n"];
+        for (unsigned i = 0; i < cn && shown < 60; i++) {
+            NSString *s = [NSString stringWithUTF8String:names[i]], *l = s.lowercaseString;
+            for (NSString *k in @[@"link", @"branch", @"deeplink", @"route", @"universal", @"invite", @"joinmesh", @"urlhandler"]) if ([l containsString:k]) { [o appendFormat:@"  %@\n", s]; shown++; break; }
+        }
+        free(names);
+    }
+    [gJoinLog appendString:o];
+}
+static void RYTryNext(NSArray<NSDictionary *> *at, NSInteger i, UIViewController *before, NSSet<NSString *> *base, void (^done)(BOOL)) {
+    if (i >= (NSInteger)at.count || i >= 10) { done(NO); return; }
+    NSURL *cu = at[i][@"u"]; RYVia via = (RYVia)[at[i][@"via"] integerValue];
     BOOL wasInRoom = (before != nil);  // the room screen is reused when you switch rooms, so it cannot prove anything then
-    int limit = accepted ? (wasInRoom ? 20 : 50) : 4;    // accepted: 6s (already in a room) or 15s; refused: ~1s
-    __block int tries = 0;
-    [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) {
-        UIViewController *now = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
-        if (now && now != before) { [t invalidate]; [gJoinLog appendFormat:@"entered a room after: %@\n", cu]; done(YES); return; }
-        if (++tries >= limit) {
+    RYDeliverURL(cu, via, ^(BOOL accepted) { // accepted != joined: the room screen is the only proof
+        __block int limit = accepted ? (wasInRoom ? 20 : 30) : 4;    // accepted: 6s (already in a room) or 9s; refused: ~1s
+        __block int tries = 0; __block BOOL extended = NO;
+        [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) {
+            UIViewController *now = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
+            if (now && now != before) { [t invalidate]; [gJoinLog appendFormat:@"entered a room after: %@\n", cu]; done(YES); return; }
+            if (++tries < limit) return;
+            if (accepted && !wasInRoom && !extended) { // the app reacted (new screen) but the room is not up yet: give it more time instead of firing the next URL
+                NSMutableSet *added = [RYScreenSet() mutableCopy]; [added minusSet:base];
+                if (added.count) { extended = YES; limit += 30; [gJoinLog appendFormat:@" new screens appeared, waiting longer: %@\n", [added.allObjects componentsJoinedByString:@", "]]; return; }
+            }
             [t invalidate];
             if (accepted && wasInRoom) { [gJoinLog appendString:@" accepted while already in a room: cannot verify\n"]; done(YES); return; }
-            if (accepted) { // stop here (no double joins) and record what the app is showing
-                NSMutableString *o = [NSMutableString new]; for (UIWindow *w in RYAppWindows()) RYDump(w.rootViewController, 0, o);
-                [gJoinLog appendFormat:@" accepted but no room after 15s. screens now:\n%@", o]; done(NO);
-            } else { [gJoinLog appendString:@" refused, next\n"]; RYTryNext(urls, i + 1, before, done); }
-        }
-    }];
+            [gJoinLog appendFormat:@" %@, next\n", accepted ? @"accepted but no room" : @"refused"];
+            RYTryNext(at, i + 1, before, base, done);
+        }];
+    });
 }
 static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
     gJoinLog = [NSMutableString stringWithFormat:@"link: %@\n", u];
     UIViewController *before = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
-    RYTryNext(@[u], 0, before, ^(BOOL ok) {
+    NSSet<NSString *> *base = RYScreenSet();
+    NSMutableArray *first = [NSMutableArray arrayWithObject:u];
+    if ([u.host.lowercaseString isEqualToString:@"rave.link"]) { // the plist declares rave.watch / get.rave.io, not rave.link: the app may only recognise those
+        for (NSString *h in @[@"rave.watch", @"get.rave.io"]) { NSURLComponents *c = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO]; c.host = h; if (c.URL) [first addObject:c.URL]; }
+    }
+    RYTryNext(RYAttempts(first), 0, before, base, ^(BOOL ok) {
         if (ok) { done(YES); return; }
         NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 8;
         [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
@@ -328,17 +416,23 @@ static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [gJoinLog appendFormat:@"fetch: status=%ld error=%@ final=%@ bytes=%lu\n", (long)code, e.localizedDescription, f, (unsigned long)d.length];
                 NSMutableOrderedSet *urls = [NSMutableOrderedSet new];
-                if (f && ![f isEqual:u]) [urls addObject:f];
+                // only URLs that can belong to the app: its own schemes, or Rave's own web domains (never the YouTube link etc.)
+                void (^add)(NSURL *) = ^(NSURL *x) {
+                    NSString *sc = x.scheme.lowercaseString ?: @"";
+                    if ([sc hasPrefix:@"http"]) { NSString *h = x.host.lowercaseString ?: @""; if (![h containsString:@"rave"] && ![h containsString:@"weme"]) return; }
+                    else if (![sc containsString:@"weme"] && ![sc containsString:@"rave"]) return;
+                    [urls addObject:x];
+                };
+                if (f && ![f isEqual:u]) add(f);
                 NSArray *c = RYCandidates(html);
                 [gJoinLog appendFormat:@"candidates: %lu\n", (unsigned long)c.count];
-                // the app registers both schemes; the id is the same, so try the short scheme too
                 for (NSURL *x in c) {
-                    [urls addObject:x];
-                    NSString *sx = x.absoluteString;
-                    if ([sx hasPrefix:@"sh.weme.wemesh://"]) { NSURL *y = [NSURL URLWithString:[@"wemesh://" stringByAppendingString:[sx substringFromIndex:17]]]; if (y) [urls addObject:y]; }
+                    add(x);
+                    NSString *sx = x.absoluteString; // the app registers both schemes; the id is the same
+                    if ([sx hasPrefix:@"sh.weme.wemesh://"]) { NSURL *y = [NSURL URLWithString:[@"wemesh://" stringByAppendingString:[sx substringFromIndex:17]]]; if (y) add(y); }
                 }
                 if (!urls.count && html) [gJoinLog appendFormat:@"html:\n%@\n", html.length > 1800 ? [html substringToIndex:1800] : html];
-                RYTryNext([urls array], 0, before, done);
+                RYTryNext(RYAttempts([urls array]), 0, before, base, ^(BOOL ok2) { if (!ok2) RYJoinDiag(); done(ok2); });
             });
         }] resume];
     });
