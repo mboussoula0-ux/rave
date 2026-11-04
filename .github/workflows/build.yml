@@ -13,7 +13,7 @@ jobs:
       - name: Collect
         run: |
           mkdir -p out
-          F=$(find .theos -name Layan.dylib | head -1)
+          F=$(find .theos -name "*.dylib" | head -1)
           echo "found: $F"
           cp "$F" out/Layan.dylib
       - uses: actions/upload-artifact@v4
