@@ -832,9 +832,11 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"دخول برابط", @"Join link"), T(@"الإعدادات", @"Settings")];
+    BOOL inRoom = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT)) != nil;
+    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الإعدادات", @"Settings")];
     NSMutableArray *tb = [NSMutableArray new];
-    for (NSInteger i = 0; i < (NSInteger)names.count; i++) { [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
+    if (inRoom) for (NSInteger i = 0; i < (NSInteger)names.count; i++) { [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
+    tabsScroll.hidden = !inRoom;
     [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
     UIStackView *tabStack = RYHStack(tb, 8); tabStack.alignment = UIStackViewAlignmentFill;
     UIScrollView *scroll = [UIScrollView new]; scroll.alwaysBounceVertical = YES; scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
@@ -849,7 +851,7 @@ static void RYMsgLoopSet(BOOL on) {
         [head.leadingAnchor constraintEqualToAnchor:sg.leadingAnchor constant:16], [head.trailingAnchor constraintEqualToAnchor:sg.trailingAnchor constant:-16],
         [tabsScroll.topAnchor constraintEqualToAnchor:head.bottomAnchor constant:12],
         [tabsScroll.leadingAnchor constraintEqualToAnchor:sg.leadingAnchor], [tabsScroll.trailingAnchor constraintEqualToAnchor:sg.trailingAnchor],
-        [tabsScroll.heightAnchor constraintEqualToConstant:40],
+        [tabsScroll.heightAnchor constraintEqualToConstant:(inRoom ? 40 : 0)],
         [tabStack.topAnchor constraintEqualToAnchor:tabsScroll.contentLayoutGuide.topAnchor], [tabStack.bottomAnchor constraintEqualToAnchor:tabsScroll.contentLayoutGuide.bottomAnchor],
         [tabStack.leadingAnchor constraintEqualToAnchor:tabsScroll.contentLayoutGuide.leadingAnchor constant:16], [tabStack.trailingAnchor constraintEqualToAnchor:tabsScroll.contentLayoutGuide.trailingAnchor constant:-16],
         [tabStack.heightAnchor constraintEqualToAnchor:tabsScroll.frameLayoutGuide.heightAnchor],
@@ -861,7 +863,8 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 3: [self renderJoin]; break; default: [self renderSettings]; }
+    if (!inRoom) { [self renderJoin]; return; } // outside a room the panel is just the link box
+    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; default: [self renderSettings]; }
 }
 
 #pragma mark Locked
@@ -1246,7 +1249,7 @@ static void RYActivateCtl(id b) {
 - (void)tick {
     UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
     BOOL in = room != nil;
-    self.fab.hidden = !in; self.fab.backgroundColor = RYAccent();
+    self.fab.hidden = NO; self.fab.backgroundColor = RYAccent();
     if (in && !self.wasIn && [CF(@"autoOpen", @NO) boolValue] && !RYLocked()) [self openPanel];
     if (in != self.wasIn) RYLog(in ? @"room: opened" : @"room: CLOSED (app state %ld)", (long)UIApplication.sharedApplication.applicationState);
     self.wasIn = in;
