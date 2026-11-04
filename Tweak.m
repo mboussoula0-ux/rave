@@ -904,6 +904,67 @@ static void RYJsonLeaves(id j, NSString *key, int d, NSMutableArray *out) {
         for (id x in (NSArray *)j) RYJsonLeaves(x, key, d + 1, out);
     }
 }
+// ---- message body is a BLOB in Rave (messageBody:blob71): read it as plist / JSON / protobuf / plain text
+static BOOL RYPrintableUTF8(const unsigned char *b, size_t n) {
+    if (!n) return NO;
+    NSString *s = [[NSString alloc] initWithBytes:b length:n encoding:NSUTF8StringEncoding]; if (!s) return NO;
+    for (NSUInteger i = 0; i < s.length; i++) { unichar c = [s characterAtIndex:i]; if ((c < 0x20 && c != '\n' && c != '\t' && c != '\r') || c == 0x7f) return NO; }
+    return YES;
+}
+static BOOL RYReadVarint(const unsigned char *b, size_t n, size_t *pos, uint64_t *out) {
+    uint64_t v = 0; int sh = 0;
+    while (*pos < n && sh < 64) { unsigned char c = b[(*pos)++]; v |= (uint64_t)(c & 0x7f) << sh; if (!(c & 0x80)) { *out = v; return YES; } sh += 7; }
+    return NO;
+}
+// YES when the whole buffer is valid protobuf; strings found are appended to out (only when it parsed completely)
+static BOOL RYProto(const unsigned char *b, size_t n, int depth, NSMutableArray *out) {
+    size_t pos = 0; NSMutableArray *local = [NSMutableArray new];
+    while (pos < n) {
+        uint64_t tag = 0; if (!RYReadVarint(b, n, &pos, &tag)) return NO;
+        uint64_t wt = tag & 7, fn = tag >> 3; if (fn == 0 || wt == 3 || wt == 4 || wt > 5) return NO;
+        if (wt == 0) { uint64_t x = 0; if (!RYReadVarint(b, n, &pos, &x)) return NO; }
+        else if (wt == 1) { if (pos + 8 > n) return NO; pos += 8; }
+        else if (wt == 5) { if (pos + 4 > n) return NO; pos += 4; }
+        else {
+            uint64_t len = 0; if (!RYReadVarint(b, n, &pos, &len) || len > n - pos) return NO;
+            const unsigned char *p = b + pos; pos += (size_t)len;
+            if (len == 0) continue;
+            if (RYPrintableUTF8(p, (size_t)len)) { NSString *t = [[NSString alloc] initWithBytes:p length:(NSUInteger)len encoding:NSUTF8StringEncoding]; if (t) [local addObject:t]; }
+            else if (depth < 4) RYProto(p, (size_t)len, depth + 1, local);
+        }
+    }
+    [out addObjectsFromArray:local]; return YES;
+}
+static void RYAllLeaves(id j, NSString *key, int d, NSMutableArray *out) {
+    if (!j || d > 6) return;
+    if ([j isKindOfClass:NSString.class]) { if (!key.length || RYNameClass(key.UTF8String)) [out addObject:j]; }
+    else if ([j isKindOfClass:NSDictionary.class]) { for (id k in (NSDictionary *)j) RYAllLeaves(((NSDictionary *)j)[k], [k description], d + 1, out); }
+    else if ([j isKindOfClass:NSArray.class]) { for (id x in (NSArray *)j) RYAllLeaves(x, key, d + 1, out); }
+}
+static void RYBlobStrings(const unsigned char *b, int len, NSMutableArray *out) {
+    NSMutableArray *got = [NSMutableArray new];
+    if (len >= 8 && memcmp(b, "bplist00", 8) == 0) {
+        id pl = [NSPropertyListSerialization propertyListWithData:[NSData dataWithBytes:b length:(NSUInteger)len] options:0 format:NULL error:NULL]; RYAllLeaves(pl, nil, 0, got);
+    } else if (b[0] == '{' || b[0] == '[') {
+        id j = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:b length:(NSUInteger)len] options:0 error:nil]; RYAllLeaves(j, nil, 0, got);
+    } else if (!RYProto(b, (size_t)len, 0, got)) [got removeAllObjects];
+    if (!got.count) {
+        if (RYPrintableUTF8(b, (size_t)len)) { NSString *t = [[NSString alloc] initWithBytes:b length:(NSUInteger)len encoding:NSUTF8StringEncoding]; if (t) [got addObject:t]; }
+        else { // last resort: printable runs
+            int st = -1;
+            for (int i = 0; i <= len; i++) {
+                BOOL pr = i < len && (b[i] >= 0x20 && b[i] != 0x7f);
+                if (pr && st < 0) st = i;
+                if (!pr && st >= 0) { if (i - st >= 2 && RYPrintableUTF8(b + st, (size_t)(i - st))) { NSString *t = [[NSString alloc] initWithBytes:b + st length:(NSUInteger)(i - st) encoding:NSUTF8StringEncoding]; if (t) [got addObject:t]; } st = -1; }
+            }
+        }
+    }
+    for (NSString *x in got) {
+        NSString *t = [x stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (t.length < 1 || t.length > 2000 || RYLooksID(t.UTF8String, YES)) continue;
+        [out addObject:t];
+    }
+}
 // pulls the message text out of the current row of q (plain columns, or JSON inside a TEXT / BLOB column)
 static void RYCollectRow(sqlite3_stmt *q, NSMutableArray *strong, NSMutableArray *weak, NSMutableString *dbg) {
     int cc = sqlite3_column_count(q);
@@ -912,7 +973,7 @@ static void RYCollectRow(sqlite3_stmt *q, NSMutableArray *strong, NSMutableArray
         if (ty == SQLITE_TEXT) {
             const char *t = (const char *)sqlite3_column_text(q, c); if (!t) continue;
             size_t len = strlen(t);
-            if (dbg && dbg.length < 700) [dbg appendFormat:@"%s=%.28s | ", nm ?: "?", t];
+            if (dbg && dbg.length < 900) [dbg appendFormat:@"%s=%.28s | ", nm ?: "?", t];
             if (len < 2 || len > 6000) continue;
             if (t[0] == '{' || t[0] == '[') {
                 id j = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:t length:len] options:0 error:nil];
@@ -924,12 +985,9 @@ static void RYCollectRow(sqlite3_stmt *q, NSMutableArray *strong, NSMutableArray
             NSString *s = [NSString stringWithUTF8String:t]; if (s) [(cl == 2 ? strong : weak) addObject:s];
         } else if (ty == SQLITE_BLOB) {
             const unsigned char *b = (const unsigned char *)sqlite3_column_blob(q, c); int len = sqlite3_column_bytes(q, c);
-            if (dbg && dbg.length < 700) [dbg appendFormat:@"%s:blob%d | ", nm ?: "?", len];
-            if (b && len > 2 && len < 40000 && (b[0] == '{' || b[0] == '[')) {
-                id j = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:b length:(NSUInteger)len] options:0 error:nil];
-                if (j) RYJsonLeaves(j, nil, 0, strong);
-            }
-        } else if (dbg && dbg.length < 700) [dbg appendFormat:@"%s:t%d | ", nm ?: "?", ty];
+            if (dbg && dbg.length < 900) { [dbg appendFormat:@"%s:blob%d hex=", nm ?: "?", len]; for (int i = 0; b && i < len && i < 48; i++) [dbg appendFormat:@"%02x", b[i]]; [dbg appendString:@" | "]; }
+            if (b && len > 0 && len < 40000 && RYNameClass(nm) == 2) RYBlobStrings(b, len, strong);
+        } else if (dbg && dbg.length < 900) [dbg appendFormat:@"%s:t%d | ", nm ?: "?", ty];
     }
 }
 static void RYCaptureStmt(sqlite3_stmt *st) {
@@ -1050,7 +1108,7 @@ static void RYSaveDeleted(void) {
 }
 static BOOL RYAddDeletedInternal(NSString *raw) {
     NSString *t = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet], *n = RYNorm(t);
-    if (n.length < 2 || !gDelList) return NO;
+    if (n.length < 1 || !gDelList) return NO;
     BOOL added = NO;
     @synchronized(gDelList) {
         if (![gDelNorm containsObject:n]) {
@@ -1073,8 +1131,8 @@ static void RYClearDeleted(void) {
     RYSaveDeleted();
 }
 static BOOL RYIsDeletedText(NSString *raw) {
-    if (!gMarkRed || !gDelNorm.count || raw.length < 2 || raw.length > 4000) return NO;
-    NSString *n = RYNorm(raw); if (n.length < 2) return NO;
+    if (!gMarkRed || !gDelNorm.count || raw.length < 1 || raw.length > 4000) return NO;
+    NSString *n = RYNorm(raw); if (n.length < 1) return NO;
     @synchronized(gDelList) {
         if ([gDelNorm containsObject:n]) return YES;
         if (n.length >= 6) { // the bubble may add a name / time around the text
@@ -1104,38 +1162,57 @@ static void RYMarkView(UIView *v) {
     if (!isL && !isT) return;
     if (isT && (((UITextView *)v).isEditable || v.isFirstResponder)) return; // never the box you type in
     NSString *raw = (isL ? ((UILabel *)v).text : ((UITextView *)v).text) ?: @"";
+    BOOL chatView = [NSStringFromClass(v.class) containsString:@"NonSelectable"]; // chat bubbles; short texts are only trusted there
     NSDictionary *orig = objc_getAssociatedObject(v, kRYOrig);
     BOOL del = NO;
-    if (gMarkRed && raw.length >= 2) {
+    if (gMarkRed && raw.length >= 1 && (chatView || raw.length >= 6)) {
         NSArray *memo = objc_getAssociatedObject(v, kRYMemo);
         if (memo && [memo[0] isEqualToString:raw] && [memo[1] intValue] == gDelVer) del = [memo[2] boolValue];
         else { del = RYIsDeletedText(raw); objc_setAssociatedObject(v, kRYMemo, @[raw, @(gDelVer), @(del)], OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
     }
-    if (v.window && !v.hidden && raw.length >= 3) { // what the scan saw, for the diagnostic report
+    if (v.window && !v.hidden && raw.length >= 1) { // what the scan saw, for the diagnostic report
         gRedSeen++;
         if (gScreenSample.count >= 10) [gScreenSample removeObjectAtIndex:0];
-        [gScreenSample addObject:[NSString stringWithFormat:@"%@%@", del ? @"*" : @"", RYClip(raw, 24)]];
+        [gScreenSample addObject:[NSString stringWithFormat:@"%@%@<%@>", del ? @"*" : @"", RYClip(raw, 24), chatView ? @"chat" : @"other"]];
     }
     UIColor *red = RYRedColor();
     if (del) {
         if (!orig) {
             NSAttributedString *a = RYAttr(v);
-            orig = @{@"c": RYEffColor(v) ?: UIColor.whiteColor, @"a": a.length ? [a copy] : (id)NSNull.null, @"s": raw};
+            orig = @{@"c": RYEffColor(v) ?: UIColor.whiteColor, @"a": a.length ? [a copy] : (id)NSNull.null, @"s": raw,
+                     @"bg": v.backgroundColor ?: (id)NSNull.null, @"r": @(v.layer.cornerRadius)};
             objc_setAssociatedObject(v, kRYOrig, orig, OBJC_ASSOCIATION_RETAIN_NONATOMIC); gRedTotal++;
         }
-        if (!RYIsRed(RYEffColor(v))) {
-            RYSetColor(v, red);
-            if (!RYIsRed(RYEffColor(v))) { // the view keeps its own text attributes: paint them directly
-                NSAttributedString *a = RYAttr(v);
-                if (a.length) { NSMutableAttributedString *m = [a mutableCopy]; [m addAttribute:NSForegroundColorAttributeName value:red range:NSMakeRange(0, m.length)]; RYSetAttr(v, m); }
-            }
+        // marker 1: red + struck-through text
+        NSAttributedString *cur = RYAttr(v);
+        BOOL marked = cur.length && [cur attribute:NSStrikethroughStyleAttributeName atIndex:0 effectiveRange:NULL] && RYIsRed(RYEffColor(v));
+        if (!marked) {
+            if (cur.length) {
+                NSMutableAttributedString *m = [cur mutableCopy]; NSRange all = NSMakeRange(0, m.length);
+                [m addAttribute:NSForegroundColorAttributeName value:red range:all];
+                [m addAttribute:NSStrikethroughStyleAttributeName value:@(NSUnderlineStyleSingle) range:all];
+                [m addAttribute:NSStrikethroughColorAttributeName value:red range:all];
+                RYSetAttr(v, m);
+            } else RYSetColor(v, red);
         }
+        // marker 2: a red tint behind the text (visible even if the text drawing ignores colours)
+        UIColor *tint = [red colorWithAlphaComponent:0.22];
+        if (![v.backgroundColor isEqual:tint]) v.backgroundColor = tint;
+        if (v.layer.cornerRadius < 6) v.layer.cornerRadius = 6;
         gRedShown++; gPainted = YES;
     } else if (orig) {
-        UIColor *oc = orig[@"c"];
+        UIColor *oc = orig[@"c"]; id oa = orig[@"a"], bg = orig[@"bg"];
         if ([orig[@"s"] isEqualToString:raw]) {          // same text: put the look back (switch turned off, list cleared)
-            RYSetColor(v, oc); id oa = orig[@"a"]; if ([oa isKindOfClass:NSAttributedString.class]) RYSetAttr(v, oa);
-        } else if (RYIsRed(RYEffColor(v))) RYSetColor(v, oc);  // the app reused this view for another message
+            if ([oa isKindOfClass:NSAttributedString.class]) RYSetAttr(v, oa); else RYSetColor(v, oc);
+        } else {                                          // the app reused this view for another message: take our marks off
+            NSAttributedString *cur = RYAttr(v);
+            if (cur.length && [cur attribute:NSStrikethroughStyleAttributeName atIndex:0 effectiveRange:NULL]) {
+                NSMutableAttributedString *m = [cur mutableCopy]; NSRange all = NSMakeRange(0, m.length);
+                [m removeAttribute:NSStrikethroughStyleAttributeName range:all]; [m removeAttribute:NSStrikethroughColorAttributeName range:all];
+                [m addAttribute:NSForegroundColorAttributeName value:oc range:all]; RYSetAttr(v, m);
+            } else if (RYIsRed(RYEffColor(v))) RYSetColor(v, oc);
+        }
+        v.backgroundColor = [bg isKindOfClass:UIColor.class] ? bg : nil; v.layer.cornerRadius = [orig[@"r"] doubleValue];
         objc_setAssociatedObject(v, kRYOrig, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
