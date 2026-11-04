@@ -9,6 +9,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <CoreLocation/CoreLocation.h>
 #include <math.h>
 
@@ -847,6 +848,89 @@ static NSString *RYReport(void) {
 @property (nonatomic) BOOL invRunning;
 @property (nonatomic) NSInteger invSent;
 @property (nonatomic, copy) NSString *invStatus;
+- (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft { if (!gInvLast) return 0; NSInteger l = (NSInteger)(240 - ([NSDate date].timeIntervalSince1970 - gInvLast)); return l > 0 ? l : 0; }
+- (void)stopInvites {
+    [gInvTimer invalidate]; gInvTimer = nil;
+    if (self.invRunning) { self.invRunning = NO; if (gInvOK > 0) gInvLast = [NSDate date].timeIntervalSince1970; self.invStatus = [NSString stringWithFormat:T(@"وقف. حُدّد %ld.", @"Stopped. %ld selected."), (long)self.invSent]; }
+}
+- (void)startInvites {
+    if (self.invRunning || [self invCooldownLeft] > 0) return;
+    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
+    gInvPend = NO; gInvSending = NO; gInvFinalSend = NO; gInvDumped = NO; gInvFail = 0; gInvSelected = 0; gInvMethod = -1; gInvPendCell = nil;
+    gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.9 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
+}
+- (void)invFinish:(NSString *)why {
+    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = [NSDate date].timeIntervalSince1970;
+    self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
+    if (gInvOK == 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما تحدد أحد، انسخت التفاصيل", @" - nothing got selected, details copied")]; }
+}
+// press "Send N invites"; final = the list is finished
+- (void)invPressSend:(BOOL)final {
+    NSInteger c = 0; UIView *b = RYFindSendBtn(&c);
+    BOOL ok = b ? RYTapAncestors(b) : NO;
+    [gInvLog appendFormat:@"send button %@ (%ld selected) pressed=%d\n", b ? NSStringFromClass(b.class) : @"NOT FOUND", (long)c, ok];
+    if (!ok) {
+        UIPasteboard.generalPasteboard.string = gInvLog;
+        [self invFinish:T(@"ما قدرت أضغط زر الإرسال (انسخت التفاصيل). المحدد:", @"Could not press the send button (details copied). Selected:")];
+        return;
+    }
+    self.invStatus = [NSString stringWithFormat:T(@"ضغط إرسال (%ld)", @"Pressed send (%ld)"), (long)c];
+    gInvSending = YES; gInvSendWait = 3; gInvFinalSend = final; gInvPend = NO; gInvSelected = 0; gInvFail = 0;
+}
+- (void)invStep {
+    if (gInvSending) { // the app is busy sending: wait, then carry on (or end)
+        if (--gInvSendWait > 0) return;
+        gInvSending = NO;
+        if (gInvFinalSend) { [self invFinish:T(@"خلصت وانرسلت الدعوات. المحدد:", @"Done, invites sent. Selected:")]; return; }
+    }
+    UIScrollView *sv = RYBiggestList();
+    if (!sv) { if (++gInvIdle > 6) [self invFinish:T(@"ما لقيت قائمة بالشاشة. المحدد:", @"No list on screen. Selected:")]; return; }
+    if (gInvPend) { // did the last tap move the "Send N" counter?
+        NSInteger c = RYSendCountNow(); UIView *pc = gInvPendCell;
+        if (c > gInvPendBefore) {
+            gInvPend = NO; gInvSelected = c; self.invSent++; gInvOK++; gInvFail = 0; gInvMethod = gInvPendMethod;
+            [gInvLog appendFormat:@"  ticked (method %ld), counter=%ld\n", (long)gInvPendMethod, (long)c];
+        } else if (++gInvPendTicks < 2) { return; }
+        else {
+            NSInteger m = gInvPendMethod + 1; BOOL again = NO;
+            while (pc && m <= 3) { if (RYSelectRow(sv, pc, m)) { gInvPendMethod = m; gInvPendTicks = 0; again = YES; break; } m++; }
+            if (again) { [gInvLog appendFormat:@"  no change, trying method %ld\n", (long)m]; return; }
+            gInvPend = NO; gInvFail++; [gInvLog appendString:@"  row could not be ticked\n"];
+            if (!gInvDumped && pc) { gInvDumped = YES; RYRowDump(pc); }
+        }
+    }
+    if (gInvFail >= 3) { // three rows in a row refused: either a selection limit (send what we have) or the tap does not reach the circle
+        if (gInvSelected > 0) { [self invPressSend:NO]; return; }
+        [self invFinish:T(@"ما قدرت أحدد الدايرة. المحدد:", @"Could not tick the circle. Selected:")]; return;
+    }
+    for (UIView *cell in RYVisibleCells(sv)) {
+        NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
+        if (!key.length) [key appendFormat:@"%p", cell];
+        if ([gInvDone containsObject:key]) continue;
+        [gInvDone addObject:key];
+        gInvPendBefore = RYSendCountNow(); gInvPendCell = cell; gInvPendTicks = 0;
+        BOOL started = NO;
+        for (NSInteger m = (gInvMethod >= 0 ? gInvMethod : 0); m <= 3; m++) if (RYSelectRow(sv, cell, m)) { gInvPendMethod = m; started = YES; break; }
+        [gInvLog appendFormat:@"row %@ method=%ld started=%d\n", RYClip(key, 30), (long)gInvPendMethod, started];
+        if (!started) { gInvFail++; if (!gInvDumped) { gInvDumped = YES; RYRowDump(cell); } continue; }
+        gInvPend = YES; gInvIdle = 0;
+        self.invStatus = [NSString stringWithFormat:T(@"أحدد: %@", @"Selecting: %@"), RYClip(key, 24)];
+        return;
+    }
+    // nothing new on this screenful: scroll one page; at the end press "Send"
+    CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
+    if (sv.contentOffset.y >= maxY - 2) {
+        if (++gInvIdle >= 2) { if (gInvSelected > 0) [self invPressSend:YES]; else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")]; }
+        return;
+    }
+    [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
+    gInvIdle = 0;
+}
+- (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger code))done;
+// one-shot invite pass over the visible list (Recents / Friends screen)
+@property (nonatomic) BOOL invRunning;
+@property (nonatomic) NSInteger invSent;
+@property (nonatomic, copy) NSString *invStatus;
 - (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft;
 @end
 
@@ -1046,7 +1130,7 @@ static void RYMsgLoopSet(BOOL on) {
     __weak typeof(self) ws = self;
     [self.stack addArrangedSubview:RYCard(@[
         RYLabel(T(@"دعوة كل اللي بالقائمة", @"Invite everyone in the list"), 16, UIFontWeightBold, nil),
-        RYLabel(T(@"افتح شاشة الريسنت (أو الأصدقاء) في Layan، وخلّها ظاهرة، وبعدين اضغط ابدأ. يمر على كل شخص مرة وحدة بس، وبعدها يوقف. ما يعيد الإرسال لنفس الناس.", @"Open the Recents (or Friends) screen in Rave and keep it visible, then press Start. It goes through each person once and stops. It never re-sends to the same people."), 13, UIFontWeightRegular, RY_MUTED)])];
+        RYLabel(T(@"افتح شاشة الدعوات (الريسنت أو الأصدقاء) في Rave، وخلّها ظاهرة، وبعدين اضغط ابدأ. يحدد الدايرة لكل شخص، وبعد آخر واحد يضغط زر الإرسال. ما يعيد لنفس الناس.", @"Open the Recents (or Friends) screen in Rave and keep it visible, then press Start. It goes through each person once and stops. It never re-sends to the same people."), 13, UIFontWeightRegular, RY_MUTED)])];
     self.invLabel = RYLabel([self invText], 14, UIFontWeightMedium, nil);
     UIButton *go = RYBtn(T(@"ابدأ الدعوات", @"Start invites"), YES, ^{
         RYCore *c = [RYCore shared];
@@ -1289,6 +1373,130 @@ static void RYActivateCtl(id b) {
         [gInvLog appendFormat:@"elem %@ a11y=%d key=%@\n", NSStringFromClass([b class]), r, RYA11yKey(b)];
         if (r) gInvOK++;
     }
+}
+#pragma mark - Invite flow: tick the circle on every row, then press "Send N invites"
+
+static NSInteger gInvPendBefore, gInvPendMethod, gInvPendTicks, gInvFail, gInvMethod = -1, gInvSelected, gInvSendWait;
+static BOOL gInvPend, gInvSending, gInvFinalSend, gInvDumped;
+static __weak UIView *gInvPendCell;
+
+static NSString *RYAsciiDigits(NSString *s) {
+    NSMutableString *o = [NSMutableString new];
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c >= 0x0660 && c <= 0x0669) c = (unichar)('0' + (c - 0x0660));
+        else if (c >= 0x06F0 && c <= 0x06F9) c = (unichar)('0' + (c - 0x06F0));
+        [o appendFormat:@"%C", c];
+    }
+    return o;
+}
+// UIKit has no public "perform this tap recognizer", so call the recognizer's own targets
+static BOOL RYFireTap(UIView *v) {
+    BOOL fired = NO;
+    for (UIGestureRecognizer *g in v.gestureRecognizers) {
+        if (![g isKindOfClass:UITapGestureRecognizer.class] || !g.enabled) continue;
+        @try {
+            for (id t in (NSArray *)[g valueForKey:@"targets"]) {
+                id target = [t valueForKey:@"target"];
+                Ivar iv = class_getInstanceVariable([t class], "_action");
+                if (!target || !iv) continue;
+                SEL a = *(SEL *)((char *)(__bridge void *)t + ivar_getOffset(iv));
+                if (a && [target respondsToSelector:a]) { ((void (*)(id, SEL, id))objc_msgSend)(target, a, g); fired = YES; }
+            }
+        } @catch (__unused id e) {}
+    }
+    return fired;
+}
+static BOOL RYTapAncestors(UIView *x) {
+    int d = 0;
+    for (UIView *p = x; p && ![p isKindOfClass:UIWindow.class] && d < 6; p = p.superview, d++) {
+        if ([p isKindOfClass:UIControl.class] && ((UIControl *)p).enabled) {
+            UIControl *c = (UIControl *)p;
+            [c sendActionsForControlEvents:UIControlEventTouchDown];
+            [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+            [c sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
+            return YES;
+        }
+        if (RYFireTap(p)) return YES;
+    }
+    return [x accessibilityActivate];
+}
+// the "Send N invites" button that shows up after rows are ticked; count = N (0 when there is no such button)
+static UIView *RYFindSendBtn(NSInteger *count) {
+    NSArray *words = @[@"ارسل", @"أرسل", @"إرسال", @"ارسال", @"send", @"invite", @"دعو", @"دعوات"];
+    __block UIView *found = nil; __block NSInteger cnt = 0;
+    for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) {
+        if (found || x.hidden || x.alpha < 0.05 || !x.window) return;
+        NSString *t = nil;
+        if ([x isKindOfClass:UILabel.class]) t = ((UILabel *)x).text;
+        else if ([x isKindOfClass:UIButton.class]) { UIButton *b = (UIButton *)x; t = [b titleForState:UIControlStateNormal] ?: b.configuration.title; }
+        if (!t.length) return;
+        NSString *l = RYAsciiDigits(t).lowercaseString;
+        BOOL hit = NO; for (NSString *k in words) if ([l containsString:k]) { hit = YES; break; }
+        if (!hit) return;
+        NSInteger n = -1;
+        for (NSUInteger i = 0; i < l.length; i++) {
+            unichar c = [l characterAtIndex:i];
+            if (c >= '0' && c <= '9') { n = 0; while (i < l.length && [l characterAtIndex:i] >= '0' && [l characterAtIndex:i] <= '9') { n = n * 10 + ([l characterAtIndex:i] - '0'); i++; } break; }
+        }
+        if (n < 0) return;
+        for (UIView *p = x; p; p = p.superview) if ([p isKindOfClass:UITableView.class] || [p isKindOfClass:UICollectionView.class]) return; // names in the list are not the button
+        if (!RYVisible(x)) return;
+        found = x; cnt = n;
+    });
+    if (count) *count = found ? cnt : 0;
+    return found;
+}
+static NSInteger RYSendCountNow(void) { NSInteger c = 0; RYFindSendBtn(&c); return c; }
+// the empty circle is at the far right of the row; the person+ icon further left must never be touched
+static UIView *RYCircleIn(UIView *cell) {
+    CGRect cf = [cell convertRect:cell.bounds toView:nil];
+    __block UIView *best = nil; __block CGFloat bx = -1e9;
+    RYWalk(cell, 0, ^(UIView *x, int d) {
+        if (x == cell || x.hidden || x.alpha < 0.05) return;
+        CGRect f = [x convertRect:x.bounds toView:nil];
+        if (f.size.width > 70 || f.size.height > 70 || f.size.width < 10) return;
+        if (CGRectGetMidX(f) < CGRectGetMaxX(cf) - 48) return;
+        if (!([x isKindOfClass:UIControl.class] || x.gestureRecognizers.count)) return;
+        if (CGRectGetMidX(f) > bx) { bx = CGRectGetMidX(f); best = x; }
+    });
+    return best;
+}
+// four ways to tick a row, tried in order until the "Send N" counter goes up
+static BOOL RYSelectRow(UIScrollView *sv, UIView *cell, NSInteger m) {
+    if (m == 0) {
+        UIView *c = RYCircleIn(cell); if (![c isKindOfClass:UIControl.class]) return NO;
+        UIControl *ct = (UIControl *)c;
+        [ct sendActionsForControlEvents:UIControlEventTouchDown]; [ct sendActionsForControlEvents:UIControlEventTouchUpInside]; [ct sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
+        return YES;
+    }
+    if (m == 1) {
+        UIView *c = RYCircleIn(cell); int d = 0;
+        for (UIView *p = c; p && p != cell && d < 3; p = p.superview, d++) if (RYFireTap(p)) return YES;
+        return NO;
+    }
+    if ([sv isKindOfClass:UICollectionView.class]) {
+        UICollectionView *cv = (UICollectionView *)sv; NSIndexPath *ip = [cv indexPathForCell:(UICollectionViewCell *)cell]; id dl = cv.delegate;
+        if (!ip || ![dl respondsToSelector:@selector(collectionView:didSelectItemAtIndexPath:)]) return NO;
+        if (m == 3) [cv selectItemAtIndexPath:ip animated:NO scrollPosition:UICollectionViewScrollPositionNone];
+        [dl collectionView:cv didSelectItemAtIndexPath:ip]; return YES;
+    }
+    if ([sv isKindOfClass:UITableView.class]) {
+        UITableView *tv = (UITableView *)sv; NSIndexPath *ip = [tv indexPathForCell:(UITableViewCell *)cell]; id dl = tv.delegate;
+        if (!ip || ![dl respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) return NO;
+        if (m == 3) [tv selectRowAtIndexPath:ip animated:NO scrollPosition:UITableViewScrollPositionNone];
+        [dl tableView:tv didSelectRowAtIndexPath:ip]; return YES;
+    }
+    return NO;
+}
+static void RYRowDump(UIView *cell) {
+    [gInvLog appendFormat:@"ROW %@ list-delegate=%@\n", NSStringFromClass(cell.class), NSStringFromClass([[(UIScrollView *)cell.superview valueForKey:@"delegate"] class] ?: NSObject.class)];
+    CGRect cf = [cell convertRect:cell.bounds toView:nil];
+    RYWalk(cell, 0, ^(UIView *x, int d) {
+        CGRect f = [x convertRect:x.bounds toView:nil];
+        [gInvLog appendFormat:@"%@%@ x=%.0f w=%.0fx%.0f ctl=%d ui=%d gr=%lu a11y=%@\n", [@"" stringByPaddingToLength:d * 2 withString:@" " startingAtIndex:0], NSStringFromClass(x.class),
+            f.origin.x - cf.origin.x, f.size.width, f.size.height, [x isKindOfClass:UIControl.class], x.userInteractionEnabled, (unsigned long)x.gestureRecognizers.count, RYClip(x.accessibilityLabel ?: @"", 20)];
+    });
 }
 @implementation RYCore
 + (instancetype)shared { static RYCore *c; static dispatch_once_t t; dispatch_once(&t, ^{ c = [RYCore new]; }); return c; }
