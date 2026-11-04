@@ -1,4 +1,4 @@
-name: Build Layan
+name: Build 8ubah
 on:
   push:
   workflow_dispatch:
@@ -15,8 +15,8 @@ jobs:
           mkdir -p out
           F=$(find .theos -name "*.dylib" | head -1)
           echo "found: $F"
-          cp "$F" out/Layan.dylib
+          cp "$F" out/8ubah.dylib
       - uses: actions/upload-artifact@v4
         with:
-          name: Layan-dylib
-          path: out/Layan.dylib
+          name: 8ubah-dylib
+          path: out/8ubah.dylib
