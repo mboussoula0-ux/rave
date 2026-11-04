@@ -1133,7 +1133,41 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *type = RYBtn(T(@"كتابة الرابط", @"Type link"), NO, ^{
         [ws ask:T(@"رابط الروم", @"Room link") ph:@"rave.link/..." secure:NO ok:^(NSString *x) { [ws joinFrom:x]; }];
     });
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"دخول روم برابط", @"Join a room by link"), 15, UIFontWeightBold, nil), RYHStack(@[paste, type], 8)])];
+    NSMutableArray *rows = [NSMutableArray arrayWithObjects:RYLabel(T(@"دخول روم برابط", @"Join a room by link"), 15, UIFontWeightBold, nil), RYHStack(@[paste, type], 8), nil];
+    [rows addObject:RYBtn(T(@"اختصار", @"Shortcut"), NO, ^{ [ws addShortcut]; })];
+    NSArray *list = CF(@"shortcuts", @[]);
+    for (NSUInteger i = 0; i < list.count; i++) {
+        NSDictionary *d = list[i]; NSString *nm = d[@"n"] ?: @"", *ln = d[@"u"] ?: @"";
+        UIButton *go = RYBtn(nm, NO, ^{ [ws joinFrom:ln]; });
+        UIButton *del = RYBtn(T(@"حذف", @"Delete"), NO, ^{
+            UIAlertController *a = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:T(@"حذف الاختصار \"%@\"؟", @"Delete shortcut \"%@\"?"), nm] message:nil preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:T(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+            [a addAction:[UIAlertAction actionWithTitle:T(@"حذف", @"Delete") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+                NSMutableArray *m = [CF(@"shortcuts", @[]) mutableCopy];
+                for (NSUInteger j = 0; j < m.count; j++) if ([m[j][@"n"] isEqual:nm] && [m[j][@"u"] isEqual:ln]) { [m removeObjectAtIndex:j]; break; }
+                CS(@"shortcuts", m); [ws rebuild];
+            }]];
+            [ws presentViewController:a animated:YES completion:nil];
+        });
+        [rows addObject:RYHStack(@[go, del], 8)];
+    }
+    [self.stack addArrangedSubview:RYCard(rows)];
+}
+// a saved name + link: shows up as its own button and is kept in the app's saved settings (survives closing the app)
+- (void)addShortcut {
+    __weak typeof(self) ws = self;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"اختصار جديد", @"New shortcut") message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *t) { t.placeholder = T(@"اسم الاختصار", @"Name"); t.autocorrectionType = UITextAutocorrectionTypeNo; }];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *t) { t.placeholder = @"rave.link/..."; t.keyboardType = UIKeyboardTypeURL; t.autocorrectionType = UITextAutocorrectionTypeNo; t.autocapitalizationType = UITextAutocapitalizationTypeNone; }];
+    [a addAction:[UIAlertAction actionWithTitle:T(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:T(@"تم", @"OK") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        NSCharacterSet *ws_ = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+        NSString *nm = [a.textFields[0].text stringByTrimmingCharactersInSet:ws_], *ln = [a.textFields[1].text stringByTrimmingCharactersInSet:ws_];
+        if (!nm.length || !RYParseRoomURL(ln)) { [ws toast:T(@"اكتب اسم ورابط صحيح", @"Enter a name and a valid link")]; return; }
+        NSMutableArray *m = [CF(@"shortcuts", @[]) mutableCopy]; [m addObject:@{@"n": nm, @"u": ln}];
+        CS(@"shortcuts", m); [ws rebuild];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 #pragma mark Settings
@@ -1202,7 +1236,7 @@ static void RYMsgLoopSet(BOOL on) {
     NSData *j = [UIPasteboard.generalPasteboard.string dataUsingEncoding:NSUTF8StringEncoding];
     id o = j ? [NSJSONSerialization JSONObjectWithData:j options:0 error:nil] : nil;
     if (![o isKindOfClass:NSDictionary.class]) { [self toast:T(@"الحافظة ما فيها نسخة صالحة", @"Clipboard has no valid backup")]; return; }
-    for (NSString *k in @[@"lang", @"accent", @"autoOpen", @"bgMode", @"bgValue", @"blur", @"dim", @"messages", @"brand", @"roomClass", @"bx", @"by"]) if (o[k]) CS(k, o[k]);
+    for (NSString *k in @[@"lang", @"accent", @"autoOpen", @"bgMode", @"bgValue", @"blur", @"dim", @"messages", @"brand", @"roomClass", @"bx", @"by", @"shortcuts"]) if (o[k]) CS(k, o[k]);
     if ([CF(@"bgMode", @"") isEqual:@"image"] && ![[NSFileManager defaultManager] fileExistsAtPath:[RYDir(nil) stringByAppendingPathComponent:@"bg.jpg"]]) CS(@"bgMode", @"none");
     [[RYCore shared] bump]; [self rebuild]; [self toast:T(@"تم الاستيراد", @"Imported")];
 }
@@ -1296,6 +1330,8 @@ static void RYActivateCtl(id b) {
 static NSInteger gInvPendBefore, gInvPendMethod, gInvPendTicks, gInvFail, gInvMethod = -1, gInvSelected, gInvSendWait;
 static BOOL gInvPend, gInvSending, gInvFinalSend, gInvDumped;
 static __weak UIView *gInvPendCell;
+static NSTimeInterval gInvPendT, gInvEndT, gInvChkT, gInvSendUntil; static NSInteger gInvChkBefore; static BOOL gInvChkOn;
+static NSTimeInterval RYNow(void) { return [NSDate date].timeIntervalSince1970; }
 
 static NSString *RYAsciiDigits(NSString *s) {
     NSMutableString *o = [NSMutableString new];
@@ -1503,16 +1539,17 @@ static void RYRowDump(UIView *cell) {
 - (NSInteger)invCooldownLeft { if (!gInvLast) return 0; NSInteger l = (NSInteger)(240 - ([NSDate date].timeIntervalSince1970 - gInvLast)); return l > 0 ? l : 0; }
 - (void)stopInvites {
     [gInvTimer invalidate]; gInvTimer = nil;
-    if (self.invRunning) { self.invRunning = NO; if (gInvOK > 0) gInvLast = [NSDate date].timeIntervalSince1970; self.invStatus = [NSString stringWithFormat:T(@"وقف. حُدّد %ld.", @"Stopped. %ld selected."), (long)self.invSent]; }
+    if (self.invRunning) { self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow(); self.invStatus = [NSString stringWithFormat:T(@"وقف. حُدّد %ld.", @"Stopped. %ld selected."), (long)self.invSent]; }
 }
 - (void)startInvites {
     if (self.invRunning || [self invCooldownLeft] > 0) return;
     gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
     gInvPend = NO; gInvSending = NO; gInvFinalSend = NO; gInvDumped = NO; gInvFail = 0; gInvSelected = 0; gInvMethod = -1; gInvPendCell = nil;
-    gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.9 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
+    gInvEndT = 0; gInvChkOn = NO; gInvSendUntil = 0;
+    gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
 }
 - (void)invFinish:(NSString *)why {
-    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = [NSDate date].timeIntervalSince1970;
+    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow();
     self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
     if (gInvOK == 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما تحدد أحد، انسخت التفاصيل", @" - nothing got selected, details copied")]; }
 }
@@ -1527,56 +1564,83 @@ static void RYRowDump(UIView *cell) {
         return;
     }
     self.invStatus = [NSString stringWithFormat:T(@"ضغط إرسال (%ld)", @"Pressed send (%ld)"), (long)c];
-    gInvSending = YES; gInvSendWait = 3; gInvFinalSend = final; gInvPend = NO; gInvSelected = 0; gInvFail = 0;
+    gInvSending = YES; gInvSendUntil = RYNow() + (final ? 1.2 : 1.5); gInvFinalSend = final; gInvPend = NO; gInvChkOn = NO; gInvSelected = 0; gInvFail = 0;
 }
+// 10 ticks a second. Phase 1 (learning): tick one row at a time and watch the "Send N" counter to find which tap method works.
+// Phase 2 (fast): tick every visible row at once with that method, scroll, repeat (up to 4 screens per tick), check the counter afterwards.
 - (void)invStep {
-    if (gInvSending) { // the app is busy sending: wait, then carry on (or end)
-        if (--gInvSendWait > 0) return;
+    NSTimeInterval now = RYNow();
+    if (gInvSending) {
+        if (now < gInvSendUntil) return;
         gInvSending = NO;
         if (gInvFinalSend) { [self invFinish:T(@"خلصت وانرسلت الدعوات. المحدد:", @"Done, invites sent. Selected:")]; return; }
     }
     UIScrollView *sv = RYBiggestList();
-    if (!sv) { if (++gInvIdle > 6) [self invFinish:T(@"ما لقيت قائمة بالشاشة. المحدد:", @"No list on screen. Selected:")]; return; }
-    if (gInvPend) { // did the last tap move the "Send N" counter?
+    if (!sv) { if (++gInvIdle > 30) [self invFinish:T(@"ما لقيت قائمة بالشاشة. المحدد:", @"No list on screen. Selected:")]; return; }
+    if (gInvPend) { // learning: did the last tap move the counter?
         NSInteger c = RYSendCountNow(); UIView *pc = gInvPendCell;
         if (c > gInvPendBefore) {
             gInvPend = NO; gInvSelected = c; self.invSent++; gInvOK++; gInvFail = 0; gInvMethod = gInvPendMethod;
-            [gInvLog appendFormat:@"  ticked (method %ld), counter=%ld\n", (long)gInvPendMethod, (long)c];
-        } else if (++gInvPendTicks < 2) { return; }
+            [gInvLog appendFormat:@"  ticked (method %ld), counter=%ld -> fast mode\n", (long)gInvPendMethod, (long)c];
+        } else if (now - gInvPendT < 0.7) { return; }
         else {
             NSInteger m = gInvPendMethod + 1; BOOL again = NO;
-            while (pc && m <= 3) { if (RYSelectRow(sv, pc, m)) { gInvPendMethod = m; gInvPendTicks = 0; again = YES; break; } m++; }
+            while (pc && m <= 3) { if (RYSelectRow(sv, pc, m)) { gInvPendMethod = m; gInvPendT = now; again = YES; break; } m++; }
             if (again) { [gInvLog appendFormat:@"  no change, trying method %ld\n", (long)m]; return; }
             gInvPend = NO; gInvFail++; [gInvLog appendString:@"  row could not be ticked\n"];
             if (!gInvDumped && pc) { gInvDumped = YES; RYRowDump(pc); }
         }
     }
-    if (gInvFail >= 3) { // three rows in a row refused: either a selection limit (send what we have) or the tap does not reach the circle
+    if (gInvChkOn && now - gInvChkT > 0.8) { // fast mode: did the batch move the counter?
+        gInvChkOn = NO; NSInteger c = RYSendCountNow();
+        if (c > gInvChkBefore) { gInvSelected = c; gInvFail = 0; }
+        else { gInvFail += 2; [gInvLog appendFormat:@"batch check: counter %ld did not rise (was %ld)\n", (long)c, (long)gInvChkBefore]; }
+    }
+    if (gInvFail >= 3) { // refused repeatedly: a selection limit (send what we have) or the tap does not reach the circle
         if (gInvSelected > 0) { [self invPressSend:NO]; return; }
         [self invFinish:T(@"ما قدرت أحدد الدايرة. المحدد:", @"Could not tick the circle. Selected:")]; return;
     }
-    for (UIView *cell in RYVisibleCells(sv)) {
-        NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
-        if (!key.length) [key appendFormat:@"%p", cell];
-        if ([gInvDone containsObject:key]) continue;
-        [gInvDone addObject:key];
-        gInvPendBefore = RYSendCountNow(); gInvPendCell = cell; gInvPendTicks = 0;
-        BOOL started = NO;
-        for (NSInteger m = (gInvMethod >= 0 ? gInvMethod : 0); m <= 3; m++) if (RYSelectRow(sv, cell, m)) { gInvPendMethod = m; started = YES; break; }
-        [gInvLog appendFormat:@"row %@ method=%ld started=%d\n", RYClip(key, 30), (long)gInvPendMethod, started];
-        if (!started) { gInvFail++; if (!gInvDumped) { gInvDumped = YES; RYRowDump(cell); } continue; }
-        gInvPend = YES; gInvIdle = 0;
-        self.invStatus = [NSString stringWithFormat:T(@"أحدد: %@", @"Selecting: %@"), RYClip(key, 24)];
-        return;
+    BOOL anyNew = NO;
+    for (int pass = 0; pass < 4; pass++) {
+        NSInteger tapped = 0;
+        for (UIView *cell in RYVisibleCells(sv)) {
+            NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
+            if (!key.length) [key appendFormat:@"%p", cell];
+            if ([gInvDone containsObject:key]) continue;
+            [gInvDone addObject:key]; anyNew = YES;
+            if (gInvMethod < 0) { // learning: one row, then wait for the counter
+                gInvPendBefore = RYSendCountNow(); gInvPendCell = cell; gInvPendT = now;
+                BOOL started = NO;
+                for (NSInteger m = 0; m <= 3; m++) if (RYSelectRow(sv, cell, m)) { gInvPendMethod = m; started = YES; break; }
+                [gInvLog appendFormat:@"row %@ method=%ld started=%d\n", RYClip(key, 30), (long)gInvPendMethod, started];
+                if (!started) { gInvFail++; if (!gInvDumped) { gInvDumped = YES; RYRowDump(cell); } continue; }
+                gInvPend = YES; gInvIdle = 0; gInvEndT = 0;
+                self.invStatus = [NSString stringWithFormat:T(@"أحدد: %@", @"Selecting: %@"), RYClip(key, 24)];
+                return;
+            }
+            if (!gInvChkOn && tapped == 0) gInvChkBefore = RYSendCountNow();
+            if (RYSelectRow(sv, cell, gInvMethod)) tapped++;
+        }
+        if (tapped > 0) {
+            self.invSent += tapped; gInvOK += tapped; gInvIdle = 0;
+            if (!gInvChkOn) { gInvChkOn = YES; gInvChkT = now; }
+            self.invStatus = [NSString stringWithFormat:T(@"حُدّد %ld…", @"Selected %ld…"), (long)self.invSent];
+        }
+        if (gInvMethod < 0) break;
+        CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
+        if (sv.contentOffset.y >= maxY - 2) break;
+        [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
+        [sv layoutIfNeeded];
     }
-    // nothing new on this screenful: scroll one page; at the end press "Send"
     CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
-    if (sv.contentOffset.y >= maxY - 2) {
-        if (++gInvIdle >= 2) { if (gInvSelected > 0) [self invPressSend:YES]; else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")]; }
-        return;
-    }
-    [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
-    gInvIdle = 0;
+    if (anyNew) { gInvEndT = 0; return; }
+    if (gInvMethod < 0 || gInvPend) return;
+    if (sv.contentOffset.y >= maxY - 2) { // at the bottom with nothing new: wait a moment (the app may load more rows), then send
+        if (!gInvEndT) gInvEndT = now;
+        if (now - gInvEndT > 1.2 && !gInvChkOn) {
+            if (RYSendCountNow() > 0) [self invPressSend:YES]; else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")];
+        }
+    } else gInvEndT = 0;
 }
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
     UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
