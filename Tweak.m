@@ -1,4 +1,4 @@
-// Layan — local feature set (injected dylib) (injected dylib)
+// 8ubah — local feature set (injected dylib) (injected dylib)
 // Pure Objective-C runtime: no Substrate / no Logos, so it works with Feather / ESign / Sideloadly injection.
 // UNTESTED on a device: class names are tunable from Settings > Advanced.
 
@@ -34,7 +34,7 @@ static void CS(NSString *k, id v) {
     @try { [[NSUserDefaults standardUserDefaults] setObject:gCfg forKey:RY_CFG]; } @catch (__unused id e) {}
 }
 static NSString *RYDir(NSString *sub) {
-    NSString *b = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"Layan"] copy];
+    NSString *b = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"8ubah"] copy];
     if (sub) b = [b stringByAppendingPathComponent:sub];
     [[NSFileManager defaultManager] createDirectoryAtPath:b withIntermediateDirectories:YES attributes:nil error:nil];
     return b;
@@ -72,7 +72,7 @@ static UIColor *RYAccent(void) {
 #define RY_MUTED RYHex(@"#8A90A0")
 
 static NSString *RYHash(NSString *s) {
-    NSData *d = [[@"layan|" stringByAppendingString:s ?: @""] dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *d = [[@"8ubah|" stringByAppendingString:s ?: @""] dataUsingEncoding:NSUTF8StringEncoding];
     unsigned char h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(d.bytes, (CC_LONG)d.length, h);
     NSMutableString *o = [NSMutableString new];
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [o appendFormat:@"%02x", h[i]];
@@ -481,8 +481,8 @@ static void RYSetKeep(BOOL on) { gKeepOn = on; CS(@"keepOn", @(on)); if (on) [[R
 #pragma mark - Branding
 
 static NSString *RYBrand(void) {
-    NSString *s = CF(@"brandName", @"Layan");
-    return ([s isKindOfClass:NSString.class] && s.length) ? s : @"Layan";
+    NSString *s = CF(@"brandName", @"8ubah");
+    return ([s isKindOfClass:NSString.class] && s.length) ? s : @"8ubah";
 }
 static NSString *RYImgName(UIImage *im) {
     if (!im) return @"";
@@ -860,7 +860,7 @@ static UIBackgroundTaskIdentifier gBGTask = 0; // 0 == UIBackgroundTaskInvalid (
 static void RYBGRenew(BOOL on) { // keeps the process running a bit longer after leaving the app; renewed every message
     UIApplication *app = UIApplication.sharedApplication;
     UIBackgroundTaskIdentifier old = gBGTask; gBGTask = UIBackgroundTaskInvalid;
-    if (on) gBGTask = [app beginBackgroundTaskWithName:@"layan.loop" expirationHandler:^{
+    if (on) gBGTask = [app beginBackgroundTaskWithName:@"8ubah.loop" expirationHandler:^{
         UIBackgroundTaskIdentifier t = gBGTask; gBGTask = UIBackgroundTaskInvalid; if (t != UIBackgroundTaskInvalid) [app endBackgroundTask:t];
     }];
     if (old != UIBackgroundTaskInvalid) [app endBackgroundTask:old];
@@ -1216,7 +1216,7 @@ static void RYMsgLoopSet(BOOL on) {
         RYBtn(T(@"نسخ أسماء الصور بالشاشة", @"Copy on-screen image names"), NO, ^{ UIPasteboard.generalPasteboard.string = RYImageReport(); [ws toast:T(@"اننسخت", @"Copied")]; }),
         RYBtn(T(@"نسخ تقرير تشخيصي", @"Copy diagnostic report"), YES, ^{ UIPasteboard.generalPasteboard.string = RYReport(); [ws toast:T(@"اننسخ التقرير", @"Report copied")]; }),
         RYBtn([NSString stringWithFormat:T(@"اسم العلامة: %@", @"Brand name: %@"), RYBrand()], NO, ^{
-            [ws ask:T(@"الاسم اللي يظهر بدل rave", @"Name shown instead of rave") ph:@"Layan" secure:NO ok:^(NSString *x) { CS(@"brandName", x.length ? x : nil); CS(@"brandOn", @(x.length > 0)); [ws rebuild]; }];
+            [ws ask:T(@"الاسم اللي يظهر بدل rave", @"Name shown instead of rave") ph:@"8ubah" secure:NO ok:^(NSString *x) { CS(@"brandName", x.length ? x : nil); CS(@"brandOn", @(x.length > 0)); [ws rebuild]; }];
         }),
         RYBtn([NSString stringWithFormat:T(@"اسم شاشة الغرفة: %@", @"Room screen class: %@"), CF(@"roomClass", RY_ROOM_DEFAULT)], NO, ^{
             [ws ask:T(@"اسم الكلاس", @"Class name") ph:RY_ROOM_DEFAULT secure:NO ok:^(NSString *s) { CS(@"roomClass", s.length ? s : nil); [ws rebuild]; }];
@@ -1673,9 +1673,9 @@ __attribute__((constructor)) static void RYInit(void) {
     RYLoad();
     // crash-loop guard: if the previous launch died within 10 seconds, this launch skips the risky parts (Anti-AFK, audio hooks)
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    BOOL safe = [ud boolForKey:@"layan.launching"];
-    [ud setBool:YES forKey:@"layan.launching"]; [ud synchronize];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ud setBool:NO forKey:@"layan.launching"]; [ud synchronize]; });
+    BOOL safe = [ud boolForKey:@"8ubah.launching"];
+    [ud setBool:YES forKey:@"8ubah.launching"]; [ud synchronize];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ud setBool:NO forKey:@"8ubah.launching"]; [ud synchronize]; });
     RYStartEventLog();
     RYLog(@"mode: %@", safe ? @"SAFE (previous launch crashed)" : @"normal");
     gKeepOn = YES; // Anti-AFK is always on: no switch, not stored, not importable
