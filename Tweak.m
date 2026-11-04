@@ -12,6 +12,14 @@
 #import <objc/message.h>
 #import <CoreLocation/CoreLocation.h>
 #include <math.h>
+#include <ctype.h>
+#include <strings.h>
+#import <dlfcn.h>
+#import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <sqlite3.h>
 
 #pragma mark - Config / storage
 
@@ -737,10 +745,122 @@ static NSString *RYClip(NSString *s, NSUInteger n) {
     s = [s stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
     return s.length > n ? [s substringToIndex:n] : s;
 }
+#pragma mark - Anti-delete for private messages (SQLite level)
+// Rave keeps DMs in a local SQLite table named "message" (GRDB). When a message is unsent / deleted, the app runs
+// DELETE FROM "message" WHERE ... . We rebind sqlite3_prepare_v2/v3 (symbol pointers only, no code patching) and turn
+// that statement into "UPDATE message SET id = id WHERE ..." (same parameters, changes nothing), so the row stays.
+// UNTESTED on a device. Needs Rave to import sqlite3 symbols (not statically linked SQLite).
+
+static volatile BOOL gAntiDel = NO;
+static volatile int gAntiDelBlocked = 0, gAntiDelImages = 0;
+static int (*orig_prepare_v2)(sqlite3 *, const char *, int, sqlite3_stmt **, const char **);
+static int (*orig_prepare_v3)(sqlite3 *, const char *, int, unsigned int, sqlite3_stmt **, const char **);
+
+// returns the part of the statement after the table name if it is a DELETE FROM message, else NULL
+static const char *RYMsgDeleteRest(const char *sql) {
+    if (!sql) return NULL;
+    while (*sql && isspace((unsigned char)*sql)) sql++;
+    if (strncasecmp(sql, "DELETE", 6) != 0) return NULL;
+    const char *p = sql + 6; while (isspace((unsigned char)*p)) p++;
+    if (strncasecmp(p, "FROM", 4) != 0) return NULL;
+    p += 4; if (!isspace((unsigned char)*p)) return NULL;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p == '"' || *p == '`' || *p == '[') p++;
+    if (strncasecmp(p, "message", 7) != 0) return NULL;
+    p += 7;
+    if (isalnum((unsigned char)*p) || *p == '_') return NULL; // messageFTS, message_status ...
+    if (*p == '"' || *p == '`' || *p == ']') p++;
+    return p;
+}
+// builds the replacement statement (caller frees); *off = offset of "rest" inside the original
+static char *RYMsgDeleteRewrite(const char *sql, int n, size_t *off, size_t *len) {
+    const char *rest = gAntiDel ? RYMsgDeleteRest(sql) : NULL;
+    if (!rest) return NULL;
+    size_t L = n < 0 ? strlen(sql) : (size_t)n, o = (size_t)(rest - sql);
+    if (o > L) return NULL;
+    const char *pre = "UPDATE message SET id = id"; size_t pl = strlen(pre), rl = L - o;
+    char *b = (char *)malloc(pl + rl + 1); if (!b) return NULL;
+    memcpy(b, pre, pl); memcpy(b + pl, rest, rl); b[pl + rl] = 0;
+    *off = o; *len = L; return b;
+}
+static void RYNoteBlocked(const char *sql) {
+    int c = ++gAntiDelBlocked;
+    if (c <= 20) RYLog(@"anti-delete: blocked #%d: %.110s", c, sql);
+}
+static int RYPrep2(sqlite3 *db, const char *sql, int n, sqlite3_stmt **st, const char **tail) {
+    size_t off = 0, L = 0; char *b = RYMsgDeleteRewrite(sql, n, &off, &L);
+    if (!b) return orig_prepare_v2(db, sql, n, st, tail);
+    const char *t2 = NULL; int rc = orig_prepare_v2(db, b, -1, st, &t2);
+    if (tail) { size_t pl = strlen("UPDATE message SET id = id"); *tail = (t2 && t2 >= b + pl) ? sql + off + (size_t)(t2 - (b + pl)) : sql + L; }
+    RYNoteBlocked(sql); free(b); return rc;
+}
+static int RYPrep3(sqlite3 *db, const char *sql, int n, unsigned int fl, sqlite3_stmt **st, const char **tail) {
+    size_t off = 0, L = 0; char *b = RYMsgDeleteRewrite(sql, n, &off, &L);
+    if (!b) return orig_prepare_v3(db, sql, n, fl, st, tail);
+    const char *t2 = NULL; int rc = orig_prepare_v3(db, b, -1, fl, st, &t2);
+    if (tail) { size_t pl = strlen("UPDATE message SET id = id"); *tail = (t2 && t2 >= b + pl) ? sql + off + (size_t)(t2 - (b + pl)) : sql + L; }
+    RYNoteBlocked(sql); free(b); return rc;
+}
+
+// minimal symbol-pointer rebinding (same idea as fishhook)
+static void RYRebindImage(const struct mach_header *mh, intptr_t slide) {
+    if (!mh || mh->magic != MH_MAGIC_64) return;
+    Dl_info di; if (dladdr(mh, &di) && di.dli_fname && (strncmp(di.dli_fname, "/usr/lib", 8) == 0 || strncmp(di.dli_fname, "/System", 7) == 0 || strstr(di.dli_fname, "libsystem"))) return;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+    const struct symtab_command *st = NULL; const struct dysymtab_command *dy = NULL; const struct segment_command_64 *le = NULL;
+    const uint8_t *c = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++, c += ((const struct load_command *)c)->cmdsize) {
+        const struct load_command *lc = (const struct load_command *)c;
+        if (lc->cmd == LC_SYMTAB) st = (const struct symtab_command *)lc;
+        else if (lc->cmd == LC_DYSYMTAB) dy = (const struct dysymtab_command *)lc;
+        else if (lc->cmd == LC_SEGMENT_64 && strcmp(((const struct segment_command_64 *)lc)->segname, SEG_LINKEDIT) == 0) le = (const struct segment_command_64 *)lc;
+    }
+    if (!st || !dy || !le || !dy->nindirectsyms) return;
+    uintptr_t base = (uintptr_t)slide + le->vmaddr - le->fileoff;
+    const struct nlist_64 *syms = (const struct nlist_64 *)(base + st->symoff);
+    const char *strs = (const char *)(base + st->stroff);
+    const uint32_t *ind = (const uint32_t *)(base + dy->indirectsymoff);
+    BOOL did = NO;
+    c = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++, c += ((const struct load_command *)c)->cmdsize) {
+        const struct load_command *lc = (const struct load_command *)c;
+        if (lc->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+        if (strcmp(sg->segname, "__DATA") != 0 && strcmp(sg->segname, "__DATA_CONST") != 0) continue;
+        const struct section_64 *sc = (const struct section_64 *)(sg + 1);
+        for (uint32_t j = 0; j < sg->nsects; j++, sc++) {
+            uint32_t ty = sc->flags & SECTION_TYPE;
+            if (ty != S_LAZY_SYMBOL_POINTERS && ty != S_NON_LAZY_SYMBOL_POINTERS) continue;
+            void **slots = (void **)((uintptr_t)slide + sc->addr); size_t cnt = sc->size / sizeof(void *);
+            const uint32_t *ix = ind + sc->reserved1; BOOL unlocked = NO;
+            for (size_t k = 0; k < cnt; k++) {
+                uint32_t si = ix[k];
+                if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL || si == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
+                const char *nm = strs + syms[si].n_un.n_strx;
+                void *rep = NULL, **save = NULL;
+                if (strcmp(nm, "_sqlite3_prepare_v2") == 0) { rep = (void *)RYPrep2; save = (void **)&orig_prepare_v2; }
+                else if (strcmp(nm, "_sqlite3_prepare_v3") == 0) { rep = (void *)RYPrep3; save = (void **)&orig_prepare_v3; }
+                else continue;
+                if (slots[k] == rep) continue;
+                if (!unlocked) { vm_protect(mach_task_self(), (vm_address_t)slots, sc->size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY); unlocked = YES; }
+                if (!*save) *save = slots[k];
+                slots[k] = rep; did = YES;
+            }
+        }
+    }
+    if (did) gAntiDelImages++; // no logging here: this runs inside dyld callbacks
+}
+static void RYInstallAntiDelete(void) {
+    static BOOL once; if (once) return; once = YES;
+    _dyld_register_func_for_add_image(RYRebindImage); // calls back for every loaded image now and for later ones
+}
+static void RYSetAntiDelete(BOOL on) { gAntiDel = on; CS(@"antiDelete", @(on)); }
+
 static NSString *RYReport(void) {
     NSMutableString *o = [NSMutableString new];
     NSDictionary *inf = NSBundle.mainBundle.infoDictionary;
     [o appendFormat:@"app %@ (%@) | iOS %@ | %@\n", inf[@"CFBundleShortVersionString"], inf[@"CFBundleVersion"], UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
+    [o appendFormat:@"anti-delete: %@ | hooked images %d | blocked %d\n", gAntiDel ? @"on" : @"off", gAntiDelImages, gAntiDelBlocked];
     UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT)), *chat = RYFindVC(CF(@"chatClass", RY_CHAT_DEFAULT));
     [o appendFormat:@"room: %@\nchat: %@\n", room ? NSStringFromClass(room.class) : @"NOT FOUND", chat ? NSStringFromClass(chat.class) : @"not found"];
     __block BOOL flutter = NO;
@@ -1192,6 +1312,11 @@ static void RYMsgLoopSet(BOOL on) {
     UISwitch *sw = [UISwitch new]; sw.on = [CF(@"autoOpen", @NO) boolValue]; sw.onTintColor = RYAccent(); __weak UISwitch *wsw = sw;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { CS(@"autoOpen", @(wsw.on)); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"افتح اللوحة تلقائيًا عند دخول الغرفة", @"Open panel automatically when I enter a room"), 14, UIFontWeightMedium, nil), sw], 12)])];
+
+    UISwitch *ad = [UISwitch new]; ad.on = gAntiDel; ad.onTintColor = RYAccent(); __weak UISwitch *wad = ad;
+    [ad addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetAntiDelete(wad.on); }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"منع حذف الرسائل الخاصة (عندك بس)", @"Keep deleted private messages (local only)"), 14, UIFontWeightMedium, nil), ad], 12),
+        RYLabel([NSString stringWithFormat:T(@"يشتغل بعد إعادة فتح التطبيق. محجوز: %d | صور محقونة: %d", @"Applies after relaunch. Blocked: %d | hooked images: %d"), gAntiDelBlocked, gAntiDelImages], 12, UIFontWeightRegular, RY_MUTED)])];
 
     NSMutableArray *key = [NSMutableArray arrayWithObject:RYLabel(T(@"مفتاح الفتح", @"Unlock key"), 15, UIFontWeightBold, nil)];
     [key addObject:RYLabel(T(@"يتخزن الهاش (SHA-256) فقط، مو المفتاح نفسه.", @"Only the SHA-256 hash is stored, never the key."), 13, UIFontWeightRegular, RY_MUTED)];
@@ -1677,7 +1802,9 @@ __attribute__((constructor)) static void RYInit(void) {
     [ud setBool:YES forKey:@"8ubah.launching"]; [ud synchronize];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ud setBool:NO forKey:@"8ubah.launching"]; [ud synchronize]; });
     RYStartEventLog();
+    gAntiDel = [CF(@"antiDelete", @YES) boolValue];
     RYLog(@"mode: %@", safe ? @"SAFE (previous launch crashed)" : @"normal");
+    if (!safe) RYInstallAntiDelete();
     gKeepOn = YES; // Anti-AFK is always on: no switch, not stored, not importable
     if (!safe) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [[RYKeep shared] start]; });
