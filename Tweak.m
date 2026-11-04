@@ -802,6 +802,50 @@ static int RYPrep3(sqlite3 *db, const char *sql, int n, unsigned int fl, sqlite3
     RYNoteBlocked(sql); free(b); return rc;
 }
 
+// ---- remember what was deleted: capture the message text of every blocked row, then paint matching labels red
+static void RYAddDeletedText(const char *utf8);   // ObjC side, defined below
+static int (*orig_bind_text)(sqlite3_stmt *, int, const char *, int, void (*)(void *));
+#define RY_BLOCK_PREFIX "UPDATE message SET id = id"
+
+static BOOL RYColKeep(const char *name, BOOL strict) {
+    if (!name) return NO;
+    char l[96]; size_t i = 0; for (; name[i] && i < 95; i++) l[i] = (char)tolower((unsigned char)name[i]); l[i] = 0;
+    if (strict) { const char *w[] = {"chat", "text", "body", "content", "msg", "message", "caption", "translat", NULL}; for (int k = 0; w[k]; k++) if (strstr(l, w[k])) return YES; return NO; }
+    const char *b[] = {"id", "thread", "user", "sender", "date", "time", "creat", "updat", "stamp", "type", "status", "state", "reply", "media", "link", "lang", "meta", "reaction", "emoji", "read", "sent", "clear", NULL};
+    for (int k = 0; b[k]; k++) if (strstr(l, b[k])) return NO; return YES;
+}
+static void RYCaptureRow(sqlite3_stmt *st, const char *idv, int n) {
+    static __thread int busy; if (busy || !idv) return; busy = 1;
+    sqlite3 *db = sqlite3_db_handle(st); sqlite3_stmt *q = NULL;
+    int rc = SQLITE_ERROR;
+    if (db && orig_prepare_v2) rc = orig_prepare_v2(db, "SELECT * FROM message WHERE id = ?", -1, &q, NULL);
+    else if (db && orig_prepare_v3) rc = orig_prepare_v3(db, "SELECT * FROM message WHERE id = ?", -1, 0, &q, NULL);
+    if (rc == SQLITE_OK && q && orig_bind_text) {
+        orig_bind_text(q, 1, idv, n, (void (*)(void *))SQLITE_TRANSIENT);
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            int cc = sqlite3_column_count(q); BOOL any = NO;
+            for (int pass = 0; pass < 2 && !any; pass++) {
+                for (int c = 0; c < cc; c++) {
+                    if (sqlite3_column_type(q, c) != SQLITE_TEXT || !RYColKeep(sqlite3_column_name(q, c), pass == 0)) continue;
+                    const char *t = (const char *)sqlite3_column_text(q, c);
+                    if (!t || strlen(t) < 2 || strlen(t) > 4000 || t[0] == '{' || t[0] == '[') continue;
+                    RYAddDeletedText(t); any = YES;
+                }
+            }
+        }
+    }
+    if (q) sqlite3_finalize(q);
+    busy = 0;
+}
+static int RYBindText(sqlite3_stmt *st, int i, const char *z, int n, void (*d)(void *)) {
+    int rc = orig_bind_text(st, i, z, n, d);
+    if (rc == SQLITE_OK && gAntiDel && z) {
+        const char *q = sqlite3_sql(st);
+        if (q && strncmp(q, RY_BLOCK_PREFIX, strlen(RY_BLOCK_PREFIX)) == 0) RYCaptureRow(st, z, n);
+    }
+    return rc;
+}
+
 // minimal symbol-pointer rebinding (same idea as fishhook)
 static void RYRebindImage(const struct mach_header *mh, intptr_t slide) {
     if (!mh || mh->magic != MH_MAGIC_64) return;
@@ -840,6 +884,7 @@ static void RYRebindImage(const struct mach_header *mh, intptr_t slide) {
                 void *rep = NULL, **save = NULL;
                 if (strcmp(nm, "_sqlite3_prepare_v2") == 0) { rep = (void *)RYPrep2; save = (void **)&orig_prepare_v2; }
                 else if (strcmp(nm, "_sqlite3_prepare_v3") == 0) { rep = (void *)RYPrep3; save = (void **)&orig_prepare_v3; }
+                else if (strcmp(nm, "_sqlite3_bind_text") == 0) { rep = (void *)RYBindText; save = (void **)&orig_bind_text; }
                 else continue;
                 if (slots[k] == rep) continue;
                 if (!unlocked) { vm_protect(mach_task_self(), (vm_address_t)slots, sc->size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY); unlocked = YES; }
@@ -850,8 +895,56 @@ static void RYRebindImage(const struct mach_header *mh, intptr_t slide) {
     }
     if (did) gAntiDelImages++; // no logging here: this runs inside dyld callbacks
 }
+
+static NSMutableSet<NSString *> *gDelSet; static BOOL gMarkRed = YES; static int gRedShown = 0;
+static NSString *RYDelFile(void) { return [RYDir(@"data") stringByAppendingPathComponent:@"deleted.json"]; }
+static void RYSaveDeleted(void) {
+    NSArray *a; @synchronized(gDelSet) { a = gDelSet.allObjects; }
+    NSData *j = [NSJSONSerialization dataWithJSONObject:a options:0 error:nil]; if (j) [j writeToFile:RYDelFile() atomically:YES];
+}
+static void RYLoadDeleted(void) {
+    gDelSet = [NSMutableSet new];
+    NSData *j = [NSData dataWithContentsOfFile:RYDelFile()]; NSArray *a = j ? [NSJSONSerialization JSONObjectWithData:j options:0 error:nil] : nil;
+    if ([a isKindOfClass:NSArray.class]) for (id x in a) if ([x isKindOfClass:NSString.class]) [gDelSet addObject:x];
+}
+static void RYAddDeletedText(const char *utf8) {
+    NSString *t = [[NSString stringWithUTF8String:utf8 ?: ""] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (t.length < 2 || !gDelSet) return;
+    BOOL added = NO; @synchronized(gDelSet) { if (gDelSet.count < 3000 && ![gDelSet containsObject:t]) { [gDelSet addObject:t]; added = YES; } }
+    if (added) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ RYSaveDeleted(); });
+}
+static void RYClearDeleted(void) { @synchronized(gDelSet) { [gDelSet removeAllObjects]; } RYSaveDeleted(); }
+static const void *kRYOrigCol = &kRYOrigCol;
+static void RYMarkView(UIView *v) {
+    UILabel *l = [v isKindOfClass:UILabel.class] ? (UILabel *)v : nil; UITextView *tv = [v isKindOfClass:UITextView.class] ? (UITextView *)v : nil;
+    if (!l && !tv) return;
+    NSString *t = [(l ? l.text : tv.text) stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    UIColor *cur = l ? l.textColor : tv.textColor, *orig = objc_getAssociatedObject(v, kRYOrigCol);
+    BOOL del = NO; if (gMarkRed && t.length >= 2) { @synchronized(gDelSet) { del = [gDelSet containsObject:t]; } }
+    UIColor *red = [UIColor colorWithRed:1 green:0.23 blue:0.27 alpha:1];
+    if (del) {
+        if (!orig) objc_setAssociatedObject(v, kRYOrigCol, cur ?: UIColor.whiteColor, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (![cur isEqual:red]) { if (l) l.textColor = red; else tv.textColor = red; }
+        gRedShown++;
+    } else if (orig) {
+        if (l) l.textColor = orig; else tv.textColor = orig;
+        objc_setAssociatedObject(v, kRYOrigCol, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+static void RYStartRedTimer(void) {
+    RYLoadDeleted(); gMarkRed = [CF(@"markRed", @YES) boolValue];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSTimer scheduledTimerWithTimeInterval:0.8 repeats:YES block:^(NSTimer *t) {
+            if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+            if (!gMarkRed && !gDelSet.count) return;
+            for (UIWindow *w in RYAppWindows()) RYWalk(w, 0, ^(UIView *x, int d) { RYMarkView(x); });
+        }];
+    });
+}
+static void RYSetMarkRed(BOOL on) { gMarkRed = on; CS(@"markRed", @(on)); }
 static void RYInstallAntiDelete(void) {
     static BOOL once; if (once) return; once = YES;
+    RYStartRedTimer();
     _dyld_register_func_for_add_image(RYRebindImage); // calls back for every loaded image now and for later ones
 }
 static void RYSetAntiDelete(BOOL on) { gAntiDel = on; CS(@"antiDelete", @(on)); }
@@ -860,7 +953,7 @@ static NSString *RYReport(void) {
     NSMutableString *o = [NSMutableString new];
     NSDictionary *inf = NSBundle.mainBundle.infoDictionary;
     [o appendFormat:@"app %@ (%@) | iOS %@ | %@\n", inf[@"CFBundleShortVersionString"], inf[@"CFBundleVersion"], UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
-    [o appendFormat:@"anti-delete: %@ | hooked images %d | blocked %d\n", gAntiDel ? @"on" : @"off", gAntiDelImages, gAntiDelBlocked];
+    [o appendFormat:@"anti-delete: %@ | hooked images %d | blocked %d | deleted texts stored %lu | red labels last scan %d\n", gAntiDel ? @"on" : @"off", gAntiDelImages, gAntiDelBlocked, (unsigned long)gDelSet.count, gRedShown];
     UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT)), *chat = RYFindVC(CF(@"chatClass", RY_CHAT_DEFAULT));
     [o appendFormat:@"room: %@\nchat: %@\n", room ? NSStringFromClass(room.class) : @"NOT FOUND", chat ? NSStringFromClass(chat.class) : @"not found"];
     __block BOOL flutter = NO;
@@ -1317,6 +1410,12 @@ static void RYMsgLoopSet(BOOL on) {
     [ad addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetAntiDelete(wad.on); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"منع حذف الرسائل الخاصة (عندك بس)", @"Keep deleted private messages (local only)"), 14, UIFontWeightMedium, nil), ad], 12),
         RYLabel([NSString stringWithFormat:T(@"يشتغل بعد إعادة فتح التطبيق. محجوز: %d | صور محقونة: %d", @"Applies after relaunch. Blocked: %d | hooked images: %d"), gAntiDelBlocked, gAntiDelImages], 12, UIFontWeightRegular, RY_MUTED)])];
+
+    UISwitch *rd = [UISwitch new]; rd.on = gMarkRed; rd.onTintColor = RYAccent(); __weak UISwitch *wrd = rd;
+    [rd addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetMarkRed(wrd.on); }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"الرسائل المحذوفة تظهر بالأحمر", @"Show deleted messages in red"), 14, UIFontWeightMedium, nil), rd], 12),
+        RYLabel([NSString stringWithFormat:T(@"المحفوظ: %lu رسالة", @"Remembered: %lu messages"), (unsigned long)gDelSet.count], 12, UIFontWeightRegular, RY_MUTED),
+        RYBtn(T(@"مسح قائمة المحذوفة", @"Clear deleted list"), NO, ^{ RYClearDeleted(); [ws rebuild]; [ws toast:T(@"انمسحت", @"Cleared")]; })])];
 
     NSMutableArray *key = [NSMutableArray arrayWithObject:RYLabel(T(@"مفتاح الفتح", @"Unlock key"), 15, UIFontWeightBold, nil)];
     [key addObject:RYLabel(T(@"يتخزن الهاش (SHA-256) فقط، مو المفتاح نفسه.", @"Only the SHA-256 hash is stored, never the key."), 13, UIFontWeightRegular, RY_MUTED)];
