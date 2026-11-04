@@ -1,19 +1,19 @@
-# Layan — تعديل ريف
+# 8ubah — تعديل ريف
 
 ## الملفات
-- `Tweak.m` الكود، `Makefile`، `.github/workflows/build.yml` (يبني `Layan.dylib` على GitHub)
+- `Tweak.m` الكود، `Makefile`، `.github/workflows/build.yml` (يبني `8ubah.dylib` على GitHub)
 - `tools/patch_ipa.py` يغيّر اسم التطبيق تحت الأيقونة + الأيقونة (يشتغل على مجلد Rave.app المفكوك)
-- `icons/` أيقونات Layan الجاهزة
+- `icons/` أيقونات 8ubah الجاهزة
 
 ## الخطوات
-1. ارفع كل الملفات للريبو (مع `.github`)، شغّل Actions ← Build Layan، نزّل `Layan-dylib`.
+1. ارفع كل الملفات للريبو (مع `.github`)، شغّل Actions ← Build 8ubah، نزّل `8ubah-dylib`.
 2. شغّل الأداة (تفك الـ IPA وتعدل الاسم والأيقونة وتحط الدايلب وتعيد الضغط صح):
-   `python3 tools/build_ipa.py Rave.ipa Layan.dylib Layan.ipa`
+   `python3 tools/build_ipa.py Rave.ipa 8ubah.dylib 8ubah.ipa`
    مهم: استخدم IPA ريف الأصلي النظيف دايمًا، مو IPA معدّل سابقًا.
-3. ثبّت `Layan.ipa` بـ Sideloadly بدون ما تفعّل خيار حقن dylib (الحقن صار داخل الـ IPA).
+3. ثبّت `8ubah.ipa` بـ Sideloadly بدون ما تفعّل خيار حقن dylib (الحقن صار داخل الـ IPA).
 
 ## ملاحظات
-- لوقو الواجهة (35x25 فوق) يتبدل بالكود وقت التشغيل إلى نص Layan.
+- لوقو الواجهة (35x25 فوق) يتبدل بالكود وقت التشغيل إلى نص 8ubah.
 - لوقو شاشة الإقلاع (LaunchScreen) داخل storyboard ما يتغير بالـ dylib.
 - الدعوات: يحدد الدايرة لكل شخص بسرعة (عدة شاشات بالثانية) ثم يضغط زر الإرسال بعد آخر واحد. لو ما اشتغل ينسخ تفاصيل الصفوف، أرسلها لي.
 - اختصار الروابط: زر "اختصار" في تبويب دخول برابط: اسم + رابط، ينحفظ ويطلع كزر دايم (يدخر في إعدادات التطبيق ويدخل ضمن التصدير/الاستيراد).
