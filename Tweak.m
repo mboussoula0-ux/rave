@@ -20,6 +20,7 @@
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <sqlite3.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <os/lock.h>
 
 #pragma mark - Config / storage
@@ -419,20 +420,33 @@ static void RYJoinDiag(void) {
     }
     [gJoinLog appendString:o];
 }
+// remember which delivery really opened a room: next time it goes first (the mesh id is the only thing that changes between links)
+static void RYLearnWinner(NSURL *cu, RYVia via) {
+    NSString *s0 = cu.absoluteString, *mid = RYMeshID(cu); NSDictionary *w = nil;
+    if (mid.length && [s0 containsString:mid]) w = @{@"k": @"id", @"t": [s0 stringByReplacingOccurrencesOfString:mid withString:@"{ID}"], @"via": @(via)};
+    else if (cu.host.length) w = @{@"k": @"host", @"t": cu.host, @"via": @(via)};
+    if (w) { CS(@"joinWin", w); [gJoinLog appendFormat:@"learned: %@\n", w]; }
+}
+static NSString *RYMeshFromHTML(NSString *html) {
+    if (!html.length) return nil;
+    NSRegularExpression *mid = [NSRegularExpression regularExpressionWithPattern:@"mesh_?[iI]d[\"'=: ]+([A-Za-z0-9_\\-]{6,})" options:0 error:nil];
+    NSTextCheckingResult *mm = [mid firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
+    return mm ? [html substringWithRange:[mm rangeAtIndex:1]] : nil;
+}
 static void RYTryNext(NSArray<NSDictionary *> *at, NSInteger i, UIViewController *before, NSSet<NSString *> *base, void (^done)(BOOL)) {
     if (i >= (NSInteger)at.count || i >= 24) { done(NO); return; }
-    NSURL *cu = at[i][@"u"]; RYVia via = (RYVia)[at[i][@"via"] integerValue];
+    NSURL *cu = at[i][@"u"]; RYVia via = (RYVia)[at[i][@"via"] integerValue]; BOOL fast = [at[i][@"fast"] boolValue];
     BOOL wasInRoom = (before != nil);  // the room screen is reused when you switch rooms, so it cannot prove anything then
     RYDeliverURL(cu, via, ^(BOOL accepted) { // accepted != joined: the room screen is the only proof
-        __block int limit = accepted ? (wasInRoom ? 20 : 30) : 4;    // accepted: 6s (already in a room) or 9s; refused: ~1s
+        __block int limit = accepted ? (wasInRoom ? 12 : (fast ? 32 : 60)) : 2; /* ticks of 0.15s: accepted 9s (learned path 4.8s, already in a room 1.8s), refused 0.3s */    // accepted: 6s (already in a room) or 9s; refused: ~1s
         __block int tries = 0; __block BOOL extended = NO;
-        [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) {
+        [NSTimer scheduledTimerWithTimeInterval:0.15 repeats:YES block:^(NSTimer *t) {
             UIViewController *now = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
-            if (now && now != before) { [t invalidate]; [gJoinLog appendFormat:@"entered a room after: %@\n", cu]; done(YES); return; }
+            if (now && now != before) { [t invalidate]; [gJoinLog appendFormat:@"entered a room after: %@\n", cu]; if (!wasInRoom) RYLearnWinner(cu, via); done(YES); return; }
             if (++tries < limit) return;
             if (accepted && !wasInRoom && !extended) { // the app reacted (new screen) but the room is not up yet: give it more time instead of firing the next URL
                 NSMutableSet *added = [RYScreenSet() mutableCopy]; [added minusSet:base];
-                if (added.count) { extended = YES; limit += 30; [gJoinLog appendFormat:@" new screens appeared, waiting longer: %@\n", [added.allObjects componentsJoinedByString:@", "]]; return; }
+                if (added.count) { extended = YES; limit += 60; [gJoinLog appendFormat:@" new screens appeared, waiting longer: %@\n", [added.allObjects componentsJoinedByString:@", "]]; return; }
             }
             [t invalidate];
             if (accepted && wasInRoom) { [gJoinLog appendString:@" accepted while already in a room: cannot verify\n"]; done(YES); return; }
@@ -449,10 +463,8 @@ static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
     if ([u.host.lowercaseString isEqualToString:@"rave.link"]) { // the plist declares rave.watch / get.rave.io, not rave.link: the app may only recognise those
         for (NSString *h in @[@"rave.watch", @"get.rave.io"]) { NSURLComponents *c = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO]; c.host = h; if (c.URL) [first addObject:c.URL]; }
     }
-    RYTryNext(RYAttempts(first), 0, before, base, ^(BOOL ok) {
-        if (ok) { done(YES); return; }
-        NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 8;
-        [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 8;
+    void (^phase2)(NSData *, NSURLResponse *, NSError *) = ^(NSData *d, NSURLResponse *resp, NSError *e) {
             NSURL *f = resp.URL;
             NSInteger code = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
             NSString *html = d.length ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
@@ -480,8 +492,40 @@ static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
                 if (!urls.count && html) [gJoinLog appendFormat:@"html:\n%@\n", html.length > 1800 ? [html substringToIndex:1800] : html];
                 RYTryNext(RYAttempts([urls array]), 0, before, base, ^(BOOL ok2) { if (!ok2) RYJoinDiag(); done(ok2); });
             });
-        }] resume];
-    });
+    };
+    // the landing page is fetched right now, in parallel with the first attempts, instead of after they all failed
+    __block NSArray *pf = nil; __block void (^waiting)(void) = nil;
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            pf = @[d ?: (id)NSNull.null, resp ?: (id)NSNull.null, e ?: (id)NSNull.null];
+            if (waiting) { void (^w)(void) = waiting; waiting = nil; w(); }
+        });
+    }] resume];
+    void (^usePF)(void) = ^{ phase2(pf[0] == NSNull.null ? nil : pf[0], pf[1] == NSNull.null ? nil : pf[1], pf[2] == NSNull.null ? nil : pf[2]); };
+    NSDictionary *win = CF(@"joinWin", nil); if (![win isKindOfClass:NSDictionary.class]) win = nil;
+    void (^normal)(void) = ^{
+        NSMutableArray *at = [NSMutableArray new];
+        if ([win[@"k"] isEqual:@"host"]) { // learned: this link's host worked last time
+            NSURLComponents *c = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO]; c.host = win[@"t"];
+            if (c.URL) [at addObject:@{@"u": c.URL, @"via": win[@"via"] ?: @0, @"fast": @YES}];
+        }
+        [at addObjectsFromArray:RYAttempts(first)];
+        RYTryNext(at, 0, before, base, ^(BOOL ok) {
+            if (ok) { done(YES); return; }
+            if (pf) usePF(); else waiting = [usePF copy];
+        });
+    };
+    if ([win[@"k"] isEqual:@"id"]) { // learned: this build opens a room from a URL that carries the mesh id
+        void (^fastGo)(void) = ^{
+            NSString *html = (pf && pf[0] != NSNull.null) ? [[NSString alloc] initWithData:pf[0] encoding:NSUTF8StringEncoding] : nil;
+            NSString *mid = RYMeshFromHTML(html);
+            NSURL *v = mid ? [NSURL URLWithString:[win[@"t"] stringByReplacingOccurrencesOfString:@"{ID}" withString:mid]] : nil;
+            if (!v) { normal(); return; }
+            [gJoinLog appendFormat:@"fast path: %@\n", v];
+            RYTryNext(@[@{@"u": v, @"via": win[@"via"] ?: @0, @"fast": @YES}], 0, before, base, ^(BOOL ok) { if (ok) done(YES); else normal(); });
+        };
+        if (pf) fastGo(); else waiting = [fastGo copy];
+    } else normal();
 }
 
 #pragma mark - Anti-AFK (keep the process alive in the background)
@@ -1068,6 +1112,209 @@ static int RYStep(sqlite3_stmt *st) {
     return orig_step(st);
 }
 
+#pragma mark - Mic voice changer (changes what the others hear; three possible capture routes, each counted so we can see which one the app really uses)
+typedef struct { const char *ar, *en; float semi; int mode; float echo; } RYPreset;
+static const RYPreset kPresets[] = {
+    {"عادي", "Normal", 0, 0, 0}, {"رجل عميق", "Deep man", -4, 0, 0}, {"وحش", "Monster", -9, 0, 0},
+    {"فتاة", "Girl", 4, 0, 0}, {"طفل", "Kid", 7, 0, 0}, {"سنجاب", "Chipmunk", 11, 0, 0},
+    {"روبوت", "Robot", 0, 1, 0}, {"ميجافون", "Megaphone", 0, 2, 0}, {"صدى", "Echo", 0, 0, 0.45f}, {"صدى عميق", "Deep echo", -4, 0, 0.4f}
+};
+#define RY_NPRESETS ((int)(sizeof(kPresets) / sizeof(kPresets[0])))
+static volatile int gMicOn = 0, gMicMode = 0, gMicPreset = 0;
+static volatile float gMicSemi = 0, gMicEcho = 0, gMicGain = 1;
+static volatile long long gMicCallsA = 0, gMicCallsU = 0, gMicCallsT = 0, gMicProc = 0;
+static volatile int gMicRebound = 0, gMicWrapped = 0, gMicTapInst = 0;
+static char gMicFmt[96] = "-";
+
+#define RYM_BUF 8192      // pitch history (power of two)
+#define RYM_ECHO 32768    // echo line (power of two)
+typedef struct { float hist[RYM_BUF]; unsigned w; float d0, d1; float eb[RYM_ECHO]; unsigned ew; float ph, hpx, hpy, lp; double sr; } RYVS;
+static RYVS gVS[3]; // 0 = AudioUnitRender, 1 = AUAudioUnit block, 2 = AVAudioEngine tap (separate state: they may run at the same time)
+
+// pitch shift = two read taps on a delay line that slides at (1 - ratio) samples per sample, cross-faded with a Hann window
+static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
+    if (s->sr != sr) { memset(s, 0, sizeof(RYVS)); s->sr = sr; s->d1 = (float)(0.016 * sr); }
+    const int W = (int)(0.032 * sr);
+    const float semi = gMicSemi, echo = gMicEcho, gain = gMicGain; const int mode = gMicMode;
+    const float dd = 1.f - powf(2.f, semi / 12.f);
+    const BOOL pitch = fabsf(semi) > 0.05f;
+    int ed = (int)(0.27 * sr); if (ed >= RYM_ECHO) ed = RYM_ECHO - 1;
+    const float rph = (float)(2.0 * M_PI * 70.0 / sr);
+    for (int i = 0; i < n; i++) {
+        float in = x[i] * gain, y = in;
+        if (pitch) {
+            s->hist[s->w & (RYM_BUF - 1)] = in;
+            float acc = 0; float *dk[2] = { &s->d0, &s->d1 };
+            for (int k = 0; k < 2; k++) {
+                float d = *dk[k]; int di = (int)d; float fr = d - (float)di;
+                float v = s->hist[(s->w - (unsigned)di) & (RYM_BUF - 1)] * (1.f - fr) + s->hist[(s->w - (unsigned)di - 1) & (RYM_BUF - 1)] * fr;
+                acc += v * (0.5f - 0.5f * cosf(6.2831853f * (d / (float)W)));
+                d += dd; if (d >= (float)W) d -= (float)W; else if (d < 0.f) d += (float)W; *dk[k] = d;
+            }
+            y = acc; s->w++;
+        }
+        if (mode == 1) { float m = sinf(s->ph); s->ph += rph; if (s->ph > 6.2831853f) s->ph -= 6.2831853f; y = y * (0.25f + 0.75f * m) * 1.35f; }
+        else if (mode == 2) { float hp = 0.95f * (s->hpy + y - s->hpx); s->hpx = y; s->hpy = hp; s->lp += 0.4f * (hp - s->lp); y = tanhf(s->lp * 3.0f); }
+        if (echo > 0.01f) { float e = s->eb[(s->ew - (unsigned)ed) & (RYM_ECHO - 1)]; s->eb[s->ew & (RYM_ECHO - 1)] = y + e * 0.4f; s->ew++; y += e * echo; }
+        if (y > 1.f) y = 1.f; else if (y < -1.f) y = -1.f;
+        x[i] = y;
+    }
+}
+// interleaved: channel 0 is processed and copied to the other channels
+static void RYProcInter(void *data, BOOL isFloat, UInt32 frames, UInt32 ch, double sr, RYVS *s) {
+    if (!data || !ch) return; float tmp[2048]; UInt32 done = 0;
+    while (done < frames) {
+        UInt32 c = frames - done; if (c > 2048) c = 2048;
+        if (isFloat) {
+            float *p = (float *)data + (size_t)done * ch;
+            for (UInt32 j = 0; j < c; j++) tmp[j] = p[j * ch];
+            RYVoiceBlock(tmp, (int)c, sr, s);
+            for (UInt32 j = 0; j < c; j++) for (UInt32 k = 0; k < ch; k++) p[j * ch + k] = tmp[j];
+        } else {
+            int16_t *p = (int16_t *)data + (size_t)done * ch;
+            for (UInt32 j = 0; j < c; j++) tmp[j] = (float)p[j * ch] / 32768.f;
+            RYVoiceBlock(tmp, (int)c, sr, s);
+            for (UInt32 j = 0; j < c; j++) { float v = tmp[j] * 32767.f; int16_t q = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : v); for (UInt32 k = 0; k < ch; k++) p[j * ch + k] = q; }
+        }
+        done += c;
+    }
+    gMicProc += frames;
+}
+static void RYProcPlanar(void **planes, UInt32 np, BOOL isFloat, UInt32 frames, double sr, RYVS *s) {
+    if (!np || !planes[0]) return; float tmp[2048]; UInt32 done = 0;
+    while (done < frames) {
+        UInt32 c = frames - done; if (c > 2048) c = 2048;
+        if (isFloat) { float *p = (float *)planes[0] + done; for (UInt32 j = 0; j < c; j++) tmp[j] = p[j]; }
+        else { int16_t *p = (int16_t *)planes[0] + done; for (UInt32 j = 0; j < c; j++) tmp[j] = (float)p[j] / 32768.f; }
+        RYVoiceBlock(tmp, (int)c, sr, s);
+        for (UInt32 q = 0; q < np; q++) {
+            if (!planes[q]) continue;
+            if (isFloat) { float *p = (float *)planes[q] + done; for (UInt32 j = 0; j < c; j++) p[j] = tmp[j]; }
+            else { int16_t *p = (int16_t *)planes[q] + done; for (UInt32 j = 0; j < c; j++) { float v = tmp[j] * 32767.f; p[j] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : v); } }
+        }
+        done += c;
+    }
+    gMicProc += frames;
+}
+// route A/U: raw buffers described by an AudioStreamBasicDescription
+static void RYMicProcessASBD(const AudioStreamBasicDescription *f, UInt32 n, AudioBufferList *io, RYVS *s) {
+    if (!f || !io || f->mFormatID != kAudioFormatLinearPCM || !io->mNumberBuffers) return;
+    BOOL isFloat = (f->mFormatFlags & kAudioFormatFlagIsFloat) != 0, planar = (f->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    UInt32 bits = f->mBitsPerChannel, ch = f->mChannelsPerFrame ? f->mChannelsPerFrame : 1;
+    if (!((isFloat && bits == 32) || (!isFloat && bits == 16))) return;
+    if (!planar) {
+        AudioBuffer *b = &io->mBuffers[0]; UInt32 frames = b->mDataByteSize / (ch * (bits / 8)); if (frames > n) frames = n;
+        RYProcInter(b->mData, isFloat, frames, ch, f->mSampleRate, s);
+    } else {
+        void *pl[8]; UInt32 np = io->mNumberBuffers > 8 ? 8 : io->mNumberBuffers; UInt32 frames = n;
+        for (UInt32 q = 0; q < np; q++) { pl[q] = io->mBuffers[q].mData; UInt32 fq = io->mBuffers[q].mDataByteSize / (bits / 8); if (fq < frames) frames = fq; }
+        RYProcPlanar(pl, np, isFloat, frames, f->mSampleRate, s);
+    }
+}
+// ---- route A: the C function AudioUnitRender (the stock WebRTC capture path calls it on input bus 1)
+static OSStatus (*orig_aurender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
+static OSStatus RYAURender(AudioUnit u, AudioUnitRenderActionFlags *fl, const AudioTimeStamp *ts, UInt32 bus, UInt32 n, AudioBufferList *io) {
+    OSStatus r = orig_aurender ? orig_aurender(u, fl, ts, bus, n, io) : -50;
+    if (r != noErr || bus != 1 || !io) return r;
+    gMicCallsA++;
+    if (!gMicOn) return r;
+    static AudioUnit lastU; static AudioStreamBasicDescription f; static BOOL ok;
+    if (u != lastU) {
+        lastU = u; UInt32 sz = sizeof f; memset(&f, 0, sizeof f);
+        ok = AudioUnitGetProperty(u, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &f, &sz) == noErr;
+        snprintf(gMicFmt, sizeof gMicFmt, "A: %.0fHz %uch %ubit %s%s", f.mSampleRate, (unsigned)f.mChannelsPerFrame, (unsigned)f.mBitsPerChannel, (f.mFormatFlags & kAudioFormatFlagIsFloat) ? "float" : "int", (f.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? " planar" : "");
+    }
+    if (ok) RYMicProcessASBD(&f, n, io, &gVS[0]);
+    return r;
+}
+// ---- route U: AUAudioUnit.renderBlock (apps that drive an AUAudioUnit themselves, e.g. a custom RTCAudioDevice)
+static NSMutableDictionary<NSString *, NSValue *> *gRBOrig;
+static AURenderBlock RYRBGetter(id self, SEL _cmd) {
+    IMP o = NULL; for (Class k = object_getClass(self); k && !o; k = class_getSuperclass(k)) { NSValue *v = gRBOrig[NSStringFromClass(k)]; if (v) o = (IMP)[v pointerValue]; }
+    AURenderBlock orig = o ? ((AURenderBlock (*)(id, SEL))o)(self, _cmd) : nil;
+    if (!orig) return orig;
+    AudioStreamBasicDescription fmt; BOOL has = NO; memset(&fmt, 0, sizeof fmt);
+    @try { AUAudioUnit *au = (AUAudioUnit *)self; if ((au.isInputEnabled || [NSStringFromClass(object_getClass(au)) containsString:@"IO"]) && au.outputBusses.count > 1) { /* only units that really capture input */ const AudioStreamBasicDescription *p = au.outputBusses[1].format.streamDescription; if (p) { fmt = *p; has = YES; } } } @catch (__unused id e) {}
+    if (!has) return orig;
+    gMicWrapped++;
+    snprintf(gMicFmt, sizeof gMicFmt, "U: %.0fHz %uch %ubit %s%s", fmt.mSampleRate, (unsigned)fmt.mChannelsPerFrame, (unsigned)fmt.mBitsPerChannel, (fmt.mFormatFlags & kAudioFormatFlagIsFloat) ? "float" : "int", (fmt.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? " planar" : "");
+    return [^AUAudioUnitStatus(AudioUnitRenderActionFlags *fl, const AudioTimeStamp *ts, AUAudioFrameCount n, NSInteger bus, AudioBufferList *io, AURenderPullInputBlock pull) {
+        AUAudioUnitStatus r = orig(fl, ts, n, bus, io, pull);
+        if (r == noErr && bus == 1 && io) { gMicCallsU++; if (gMicOn) RYMicProcessASBD(&fmt, n, io, &gVS[1]); }
+        return r;
+    } copy];
+}
+static void RYInstallRB(void) {
+    static dispatch_once_t once; dispatch_once(&once, ^{ gRBOrig = [NSMutableDictionary new]; });
+    Class base = NSClassFromString(@"AUAudioUnit"); if (!base) return;
+    SEL sel = @selector(renderBlock);
+    unsigned cnt = 0; Class *all = objc_copyClassList(&cnt);
+    for (unsigned i = 0; i < cnt; i++) {
+        Class c = all[i], k = c; BOOL isAU = NO;
+        for (; k; k = class_getSuperclass(k)) if (k == base) { isAU = YES; break; }
+        if (!isAU) continue;
+        NSString *nm = NSStringFromClass(c); if (gRBOrig[nm]) continue;
+        Method m = class_getInstanceMethod(c, sel); if (!m) continue;
+        Class sup = class_getSuperclass(c); Method sm = sup ? class_getInstanceMethod(sup, sel) : NULL;
+        if (c != base && m == sm) continue; // inherited, the class that really defines it gets patched
+        IMP cur = method_getImplementation(m); if (cur == (IMP)RYRBGetter) continue;
+        gRBOrig[nm] = [NSValue valueWithPointer:(const void *)cur];
+        class_replaceMethod(c, sel, (IMP)RYRBGetter, method_getTypeEncoding(m));
+    }
+    free(all);
+}
+// ---- route T: AVAudioEngine input-node tap (the buffer is changed before the app's own block sees it)
+typedef void (^RYTapBlock)(AVAudioPCMBuffer *, AVAudioTime *);
+static void (*orig_tap)(id, SEL, AVAudioNodeBus, AVAudioFrameCount, AVAudioFormat *, RYTapBlock);
+static void RYTapProcess(AVAudioPCMBuffer *b) {
+    AVAudioFormat *f = b.format; UInt32 n = b.frameLength, ch = f.channelCount; if (!n || !ch) return;
+    if (b.floatChannelData) {
+        float *const *cd = b.floatChannelData;
+        if (f.isInterleaved) RYProcInter(cd[0], YES, n, ch, f.sampleRate, &gVS[2]);
+        else { void *pl[8]; UInt32 np = ch > 8 ? 8 : ch; for (UInt32 q = 0; q < np; q++) pl[q] = cd[q]; RYProcPlanar(pl, np, YES, n, f.sampleRate, &gVS[2]); }
+    } else if (b.int16ChannelData) {
+        int16_t *const *cd = b.int16ChannelData;
+        if (f.isInterleaved) RYProcInter(cd[0], NO, n, ch, f.sampleRate, &gVS[2]);
+        else { void *pl[8]; UInt32 np = ch > 8 ? 8 : ch; for (UInt32 q = 0; q < np; q++) pl[q] = cd[q]; RYProcPlanar(pl, np, NO, n, f.sampleRate, &gVS[2]); }
+    }
+}
+static void RYTapInstall(id self, SEL _cmd, AVAudioNodeBus bus, AVAudioFrameCount size, AVAudioFormat *fmt, RYTapBlock blk) {
+    RYTapBlock w = blk;
+    if (blk && [self isKindOfClass:[AVAudioInputNode class]]) {
+        gMicTapInst++;
+        w = [^(AVAudioPCMBuffer *b, AVAudioTime *t) { gMicCallsT++; if (gMicOn) RYTapProcess(b); blk(b, t); } copy];
+    }
+    orig_tap(self, _cmd, bus, size, fmt, w);
+}
+static void RYInstallTapHook(void) {
+    Method m = class_getInstanceMethod([AVAudioNode class], @selector(installTapOnBus:bufferSize:format:block:));
+    if (!m || orig_tap) return;
+    orig_tap = (void (*)(id, SEL, AVAudioNodeBus, AVAudioFrameCount, AVAudioFormat *, RYTapBlock))method_getImplementation(m);
+    method_setImplementation(m, (IMP)RYTapInstall);
+}
+// ---- settings
+static void RYMicLoad(void) {
+    gMicOn = [CF(@"micOn", @NO) boolValue]; gMicPreset = [CF(@"micPreset", @0) intValue]; gMicSemi = [CF(@"micSemi", @0) floatValue];
+    gMicMode = [CF(@"micMode", @0) intValue]; gMicEcho = [CF(@"micEcho", @0) floatValue]; gMicGain = [CF(@"micGain", @1) floatValue];
+}
+static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
+static void RYMicApplyPreset(int i) {
+    if (i < 0 || i >= RY_NPRESETS) return; const RYPreset *p = &kPresets[i];
+    gMicPreset = i; gMicSemi = p->semi; gMicMode = p->mode; gMicEcho = p->echo;
+    CS(@"micPreset", @(i)); CS(@"micSemi", @(p->semi)); CS(@"micMode", @(p->mode)); CS(@"micEcho", @(p->echo));
+}
+static NSString *RYMicStatus(void) {
+    long long calls = gMicCallsA + gMicCallsU + gMicCallsT;
+    if (!calls) return T(@"لسا ما التقطت المايك. ادخل صوت الغرفة وافتح المايك، وبعدها تظهر الحالة هنا.", @"No microphone data seen yet. Join voice in a room and unmute; the status shows up here.");
+    NSString *route = gMicCallsA ? @"A" : gMicCallsU ? @"U" : @"T";
+    if (!gMicOn) return [NSString stringWithFormat:T(@"المايك مرصود ✓ (مسار %@)، المغيّر مطفي.", @"Microphone detected ✓ (route %@), changer is off."), route];
+    return [NSString stringWithFormat:T(@"يشتغل ✓ (مسار %@، إطارات معالجة: %lld)", @"Working ✓ (route %@, frames processed: %lld)"), route, (long long)gMicProc];
+}
+static NSString *RYMicReport(void) {
+    return [NSString stringWithFormat:@"mic voice changer\non=%d preset=%d semi=%.1f mode=%d echo=%.2f gain=%.2f\nroute A (AudioUnitRender bus 1): calls=%lld, images rebound=%d\nroute U (AUAudioUnit renderBlock): calls=%lld, blocks wrapped=%d\nroute T (AVAudioEngine input tap): calls=%lld, taps installed=%d\nframes processed=%lld\nformat=%s\n",
+        gMicOn, gMicPreset, gMicSemi, gMicMode, gMicEcho, gMicGain, gMicCallsA, gMicRebound, gMicCallsU, gMicWrapped, gMicCallsT, gMicTapInst, (long long)gMicProc, gMicFmt];
+}
+
 // minimal symbol-pointer rebinding (same idea as fishhook)
 static void RYRebindImage(const struct mach_header *mh, intptr_t slide) {
     if (!mh || mh->magic != MH_MAGIC_64) return;
@@ -1107,6 +1354,7 @@ static void RYRebindImage(const struct mach_header *mh, intptr_t slide) {
                 if (strcmp(nm, "_sqlite3_prepare_v2") == 0) { rep = (void *)RYPrep2; save = (void **)&orig_prepare_v2; }
                 else if (strcmp(nm, "_sqlite3_prepare_v3") == 0) { rep = (void *)RYPrep3; save = (void **)&orig_prepare_v3; }
                 else if (strcmp(nm, "_sqlite3_step") == 0) { rep = (void *)RYStep; save = (void **)&orig_step; }
+                else if (strcmp(nm, "_AudioUnitRender") == 0) { rep = (void *)RYAURender; save = (void **)&orig_aurender; if (slots[k] != rep) gMicRebound++; }
                 else continue;
                 if (slots[k] == rep) continue;
                 if (!unlocked) { vm_protect(mach_task_self(), (vm_address_t)slots, sc->size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY); unlocked = YES; }
@@ -1264,10 +1512,18 @@ static void RYStartRedTimer(void) {
     });
 }
 static void RYSetMarkRed(BOOL on) { gMarkRed = on; CS(@"markRed", @(on)); gDelVer++; }
+static void RYInstallRebind(void) {
+    static BOOL once; if (once) return; once = YES;
+    _dyld_register_func_for_add_image(RYRebindImage); // calls back for every loaded image now and for later ones
+}
+static void RYInstallMic(void) {
+    RYMicLoad(); RYInstallRebind(); RYInstallTapHook(); RYInstallRB();
+    for (NSNumber *sec in @[@2, @6, @15]) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ RYInstallRB(); }); // AU classes may load late
+}
 static void RYInstallAntiDelete(void) {
     static BOOL once; if (once) return; once = YES;
     RYStartRedTimer();
-    _dyld_register_func_for_add_image(RYRebindImage); // calls back for every loaded image now and for later ones
+    RYInstallRebind();
 }
 static void RYSetAntiDelete(BOOL on) { gAntiDel = on; CS(@"antiDelete", @(on)); }
 
@@ -1467,12 +1723,10 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    BOOL inRoom = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT)) != nil;
-    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الإعدادات", @"Settings"), T(@"دخول برابط", @"Join link")];
-    // inside a room: everything. Outside a room: the link box + settings (tab 4 = join link, tab 3 = settings)
-    NSArray<NSNumber *> *order = inRoom ? @[@0, @1, @2, @4, @3] : @[@4, @3];
-    if (inRoom && self.tab > 4) self.tab = 0;
-    if (!inRoom && self.tab != 3) self.tab = 4;
+    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الإعدادات", @"Settings"), T(@"دخول برابط", @"Join link"), T(@"مايك", @"Mic")];
+    // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
+    NSArray<NSNumber *> *order = @[@0, @1, @2, @5, @4, @3];
+    if (self.tab < 0 || self.tab > 5) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -1502,7 +1756,7 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 4: [self renderJoin]; break; default: [self renderSettings]; }
+    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 4: [self renderJoin]; break; case 5: [self renderMic]; break; default: [self renderSettings]; }
 }
 
 #pragma mark Saved deleted messages
@@ -1726,6 +1980,27 @@ static void RYMsgLoopSet(BOOL on) {
     [self presentViewController:a animated:YES completion:nil];
 }
 
+#pragma mark Mic
+- (void)renderMic {
+    __weak typeof(self) ws = self;
+    UISwitch *sw = [UISwitch new]; sw.on = gMicOn != 0; sw.onTintColor = RYAccent(); __weak UISwitch *wsw = sw;
+    [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetOn(wsw.on); }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تشغيل مغيّر الصوت", @"Voice changer"), 15, UIFontWeightBold, nil), sw], 12),
+        RYLabel(T(@"يغيّر صوتك اللي يسمعه اللي معك في الغرفة (أنت ما تسمعه). ادخل صوت الغرفة وافتح المايك أول.", @"Changes your voice for the others in the room (you do not hear it). Join voice and unmute first."), 13, UIFontWeightRegular, RY_MUTED)])];
+    NSMutableArray *bs = [NSMutableArray new];
+    for (int i = 0; i < RY_NPRESETS; i++) {
+        NSString *nm = [NSString stringWithUTF8String:RYAr() ? kPresets[i].ar : kPresets[i].en];
+        [bs addObject:RYBtn(nm, i == gMicPreset, ^{ RYMicApplyPreset(i); RYMicSetOn(YES); [ws rebuild]; })];
+    }
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"الأصوات", @"Voices"), 15, UIFontWeightBold, nil), RYGrid(bs, 3)])];
+    [self.stack addArrangedSubview:RYSlider(T(@"درجة الصوت (نغمات)", @"Pitch (semitones)"), -12, 12, gMicSemi, ^(float v) { gMicSemi = v; gMicPreset = -1; CS(@"micSemi", @(v)); CS(@"micPreset", @(-1)); })];
+    [self.stack addArrangedSubview:RYSlider(T(@"الصدى", @"Echo"), 0, 1, gMicEcho, ^(float v) { gMicEcho = v; CS(@"micEcho", @(v)); })];
+    [self.stack addArrangedSubview:RYSlider(T(@"مستوى المايك", @"Mic level"), 0.5, 2, gMicGain, ^(float v) { gMicGain = v; CS(@"micGain", @(v)); })];
+    self.invLabel = RYLabel(RYMicStatus(), 13, UIFontWeightMedium, RY_MUTED);
+    [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYBtn(T(@"نسخ تشخيص المايك", @"Copy mic diagnostics"), NO, ^{ UIPasteboard.generalPasteboard.string = RYMicReport(); [ws toast:T(@"اننسخ", @"Copied")]; })])];
+    [self.invUI invalidate];
+    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = RYMicStatus(); }];
+}
 #pragma mark Settings
 - (void)renderSettings {
     __weak typeof(self) ws = self;
@@ -2248,6 +2523,7 @@ __attribute__((constructor)) static void RYInit(void) {
     gAntiDel = [CF(@"antiDelete", @YES) boolValue];
     RYLog(@"mode: %@", safe ? @"SAFE (previous launch crashed)" : @"normal");
     if (!safe) RYInstallAntiDelete();
+    if (!safe) RYInstallMic();
     gKeepOn = YES; // Anti-AFK is always on: no switch, not stored, not importable
     if (!safe) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [[RYKeep shared] start]; });
