@@ -258,21 +258,46 @@ static NSURL *RYParseRoomURL(NSString *s) {
 typedef NS_ENUM(NSInteger, RYVia) { RYViaDirect = 0, RYViaSystem = 1, RYViaActivity = 2 };
 static NSString *RYMeshID(NSURL *u) {
     NSURLComponents *c = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO];
-    for (NSURLQueryItem *q in c.queryItems) if ([q.name.lowercaseString isEqualToString:@"mesh_id"] || [q.name.lowercaseString isEqualToString:@"meshid"]) return q.value;
+    for (NSURLQueryItem *q in c.queryItems) { NSString *n = q.name.lowercaseString; if (([n isEqualToString:@"mesh_id"] || [n isEqualToString:@"meshid"] || [n isEqualToString:@"id"]) && q.value.length >= 6) return q.value; }
     NSString *l = u.path.lastPathComponent; return l.length >= 6 ? l : nil;
+}
+// Rave 9: the plist lists the Handoff type "com.io.rave.mesh" and the app registers rave:// io.rave:// wemesh:// (older builds: sh.weme.wemesh). Read them from the plist so a rename cannot break us again.
+static NSArray<NSString *> *RYMeshActivityTypes(void) {
+    NSMutableOrderedSet *s = [NSMutableOrderedSet new];
+    for (NSString *t in ([NSBundle.mainBundle objectForInfoDictionaryKey:@"NSUserActivityTypes"] ?: @[])) if ([t.lowercaseString containsString:@"mesh"]) [s addObject:t];
+    [s addObject:@"com.io.rave.mesh"]; [s addObject:@"com.sh.weme.wemesh.mesh"];
+    return s.array;
+}
+static NSArray<NSString *> *RYAppSchemes(void) { // the app's own custom schemes (not Facebook / Google / VK / Twitter login ones)
+    NSMutableOrderedSet *s = [NSMutableOrderedSet new];
+    for (NSDictionary *t in ([NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleURLTypes"] ?: @[]))
+        for (NSString *x in (t[@"CFBundleURLSchemes"] ?: @[])) { NSString *l = x.lowercaseString; if ([l hasPrefix:@"fb"] || [l hasPrefix:@"vk"] || [l hasPrefix:@"twitterkit"] || [l hasPrefix:@"com.googleusercontent"]) continue; [s addObject:x]; }
+    for (NSString *x in @[@"rave", @"wemesh", @"io.rave", @"sh.weme.wemesh"]) [s addObject:x];
+    return s.array;
 }
 static NSMutableString *gJoinLog;
 static void RYDeliverURL(NSURL *u, RYVia via, void (^res)(BOOL accepted)) {
     UIApplication *app = UIApplication.sharedApplication;
     BOOL web = [u.scheme.lowercaseString hasPrefix:@"http"];
     [gJoinLog appendFormat:@"deliver[%@]: %@ (app state %ld)\n", via == RYViaSystem ? @"system" : via == RYViaActivity ? @"handoff" : @"direct", u, (long)app.applicationState];
-    if (via == RYViaActivity) { // the plist lists a Handoff type for rooms: com.sh.weme.wemesh.mesh
-        NSString *mid = RYMeshID(u); id ad0 = app.delegate;
-        if (!mid || ![ad0 respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)]) { res(NO); return; }
-        NSUserActivity *act = [[NSUserActivity alloc] initWithActivityType:@"com.sh.weme.wemesh.mesh"];
-        [act addUserInfoEntriesFromDictionary:@{@"mesh_id": mid, @"meshId": mid, @"id": mid}];
-        BOOL r = [ad0 application:app continueUserActivity:act restorationHandler:^(NSArray<id<UIUserActivityRestoring>> *x) {}];
-        [gJoinLog appendFormat:@" handoff activity continue -> %d\n", r]; res(r); return;
+    if (via == RYViaActivity) { // Handoff "mesh" activity: the app logs "Continuing Handoff mesh activity: meshId ..." for it
+        NSString *mid = RYMeshID(u); id ad0 = app.delegate; BOOL any = NO;
+        if (!mid) { res(NO); return; }
+        for (NSString *type in RYMeshActivityTypes()) {
+            NSUserActivity *act = [[NSUserActivity alloc] initWithActivityType:type];
+            [act addUserInfoEntriesFromDictionary:@{@"meshId": mid, @"mesh_id": mid, @"id": mid}];
+            for (UIScene *sc in app.connectedScenes) {
+                id d = sc.delegate;
+                if ([d respondsToSelector:@selector(scene:continueUserActivity:)]) { [d scene:sc continueUserActivity:act]; any = YES; [gJoinLog appendFormat:@" scene handoff (%@)\n", type]; }
+            }
+            if ([ad0 respondsToSelector:@selector(application:continueUserActivity:restorationHandler:)]) {
+                BOOL r = [ad0 application:app continueUserActivity:act restorationHandler:^(NSArray<id<UIUserActivityRestoring>> *x) {}];
+                [gJoinLog appendFormat:@" app delegate handoff (%@) -> %d\n", type, r]; any = any || r;
+            }
+            if (any) break;
+        }
+        if (!any) [gJoinLog appendString:@" handoff: nobody accepted it\n"];
+        res(any); return;
     }
     if (via == RYViaSystem) {
         [app openURL:u options:@{} completionHandler:^(BOOL ok) {
@@ -322,9 +347,12 @@ static NSArray<NSURL *> *RYCandidates(NSString *html) {
         NSString *id_ = [html substringWithRange:[mm rangeAtIndex:1]];
         [gJoinLog appendFormat:@"mesh id in page: %@\n", id_];
         // we do not know which shape the app parses, so offer every known one (each is tried and verified in turn)
-        for (NSString *f in @[@"wemesh://mesh?mesh_id={id}", @"wemesh://mesh/{id}", @"sh.weme.wemesh://mesh?mesh_id={id}", @"sh.weme.wemesh://mesh/{id}"]) {
-            NSURL *g = [NSURL URLWithString:[f stringByReplacingOccurrencesOfString:@"{id}" withString:id_]]; if (g) [out addObject:g];
+        for (NSString *sc in @[@"rave", @"wemesh"]) for (NSString *f in @[@"%@://mesh?mesh_id=%@", @"%@://mesh/%@", @"%@://mesh?meshId=%@"]) {
+            NSURL *g = [NSURL URLWithString:[NSString stringWithFormat:f, sc, id_]]; if (g) [out addObject:g];
         }
+        for (NSString *sc in @[@"io.rave", @"sh.weme.wemesh"]) { NSURL *g = [NSURL URLWithString:[NSString stringWithFormat:@"%@://mesh?mesh_id=%@", sc, id_]]; if (g) [out addObject:g]; }
+        // Rave 9 logs "Could not handle Rave universal link. Both meshId and videoUrl are nil": it reads a meshId from the link itself
+        for (NSString *h in @[@"rave.watch", @"rave.link"]) { NSURL *g = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/?meshId=%@", h, id_]]; if (g) [out addObject:g]; }
     }
     return [[out array] sortedArrayWithOptions:NSSortStable usingComparator:^NSComparisonResult(NSURL *p, NSURL *q) {
         BOOL cp = ![p.scheme.lowercaseString hasPrefix:@"http"], cq = ![q.scheme.lowercaseString hasPrefix:@"http"];
@@ -335,7 +363,11 @@ static NSArray<NSURL *> *RYCandidates(NSString *html) {
 static NSArray<NSDictionary *> *RYAttempts(NSArray<NSURL *> *urls) {
     NSMutableArray *a = [NSMutableArray new]; BOOL act = NO;
     for (NSURL *x in urls) {
-        if ([x.scheme.lowercaseString hasPrefix:@"http"]) { [a addObject:@{@"u": x, @"via": @(RYViaDirect)}]; continue; }
+        if ([x.scheme.lowercaseString hasPrefix:@"http"]) {
+            [a addObject:@{@"u": x, @"via": @(RYViaDirect)}];
+            if (!act && RYMeshID(x)) { act = YES; [a addObject:@{@"u": x, @"via": @(RYViaActivity)}]; }
+            continue;
+        }
         [a addObject:@{@"u": x, @"via": @(RYViaSystem)}];
         [a addObject:@{@"u": x, @"via": @(RYViaDirect)}];
         if (!act && RYMeshID(x)) { act = YES; [a addObject:@{@"u": x, @"via": @(RYViaActivity)}]; }
@@ -368,6 +400,7 @@ static void RYJoinDiag(void) {
     [o appendFormat:@"bundle id: %@\n", NSBundle.mainBundle.bundleIdentifier];
     [o appendFormat:@"app delegate: %@\n", NSStringFromClass([ad class])];
     for (NSDictionary *t in ([NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleURLTypes"] ?: @[])) [o appendFormat:@"url schemes: %@\n", [t[@"CFBundleURLSchemes"] componentsJoinedByString:@","]];
+    [o appendFormat:@"activity types: %@ | app schemes: %@\n", [RYMeshActivityTypes() componentsJoinedByString:@","], [RYAppSchemes() componentsJoinedByString:@","]];
     [o appendFormat:@"Branch SDK class: %@\n", NSClassFromString(@"Branch") ? @"yes" : @"no"];
     [o appendString:@"app delegate methods:\n"]; RYListMethods([ad class], o);
     for (UIScene *sc in app.connectedScenes) {
@@ -387,7 +420,7 @@ static void RYJoinDiag(void) {
     [gJoinLog appendString:o];
 }
 static void RYTryNext(NSArray<NSDictionary *> *at, NSInteger i, UIViewController *before, NSSet<NSString *> *base, void (^done)(BOOL)) {
-    if (i >= (NSInteger)at.count || i >= 10) { done(NO); return; }
+    if (i >= (NSInteger)at.count || i >= 24) { done(NO); return; }
     NSURL *cu = at[i][@"u"]; RYVia via = (RYVia)[at[i][@"via"] integerValue];
     BOOL wasInRoom = (before != nil);  // the room screen is reused when you switch rooms, so it cannot prove anything then
     RYDeliverURL(cu, via, ^(BOOL accepted) { // accepted != joined: the room screen is the only proof
@@ -438,8 +471,11 @@ static void RYJoinLink(NSURL *u, void (^done)(BOOL)) {
                 [gJoinLog appendFormat:@"candidates: %lu\n", (unsigned long)c.count];
                 for (NSURL *x in c) {
                     add(x);
-                    NSString *sx = x.absoluteString; // the app registers both schemes; the id is the same
-                    if ([sx hasPrefix:@"sh.weme.wemesh://"]) { NSURL *y = [NSURL URLWithString:[@"wemesh://" stringByAppendingString:[sx substringFromIndex:17]]]; if (y) add(y); }
+                    NSString *sx = x.absoluteString, *sc0 = x.scheme.lowercaseString; // the app registers several schemes; the id is the same
+                    if (sc0.length && ![sc0 hasPrefix:@"http"] && [[RYAppSchemes() valueForKeyPath:@"lowercaseString"] containsObject:sc0]) {
+                        NSString *rest = [sx substringFromIndex:MIN(sx.length, sc0.length + 3)];
+                        for (NSString *o in @[@"rave", @"wemesh"]) if (![o isEqualToString:sc0]) { NSURL *y = [NSURL URLWithString:[NSString stringWithFormat:@"%@://%@", o, rest]]; if (y) add(y); }
+                    }
                 }
                 if (!urls.count && html) [gJoinLog appendFormat:@"html:\n%@\n", html.length > 1800 ? [html substringToIndex:1800] : html];
                 RYTryNext(RYAttempts([urls array]), 0, before, base, ^(BOOL ok2) { if (!ok2) RYJoinDiag(); done(ok2); });
