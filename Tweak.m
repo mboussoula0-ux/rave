@@ -2,6 +2,15 @@
 // Pure Objective-C runtime: no Substrate / no Logos, so it works with Feather / ESign / Sideloadly injection.
 // UNTESTED on a device: class names are tunable from Settings > Advanced.
 
+// =====================================================================================================================
+// RULE FOR ANY AI / EDITOR THAT MODIFIES THIS FILE  (the owner asked for this, do not break it)
+//   NO EXPLANATORY TEXT IN THE UI. Never add help / description / hint / tip / note / warning labels under a title, switch, slider,
+//   button or inside a card, in ANY tab or menu (panel tabs, settings, mic, link join, invites, quick messages, backgrounds,
+//   lock screen, reports). Every control gets only its own SHORT name.
+//   Allowed: short names; short live STATUS lines that show a current value ("Ready", "Saved: 3", "Default ✓"); toasts and alerts that
+//   follow an action; text-field placeholders; error messages.
+//   New feature? Put the explanation in your reply to the owner, never in the app. If you find an explanation label while editing, delete it.
+// =====================================================================================================================
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <PhotosUI/PhotosUI.h>
@@ -1535,7 +1544,7 @@ static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
 static void RYMicSetRev(BOOL on) { gMicRev = on; CS(@"micRev", @(on)); }
 static void RYRevSave(void) { NSMutableArray *a = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) [a addObject:@(gRv[i])]; CS(@"revCfg", a); CS(@"revCfgVer", @2); }
 static BOOL RYRevIsDefault(void) { for (int i = 0; i < RV_N; i++) if (fabsf(gRv[i] - kRvDef[i]) > 0.0005f) return NO; return YES; }
-static NSString *RYRevStateText(void) { return RYRevIsDefault() ? T(@"القيم = الافتراضية (نفس Dragonfly بالصورة) ✓", @"Values = defaults (same as the Dragonfly screenshot) ✓") : T(@"القيم معدّلة. اضغط \"رجّع الافتراضي\" لو تبي ترجع للأصل.", @"Values changed. Press \"Reset to default\" to go back."); }
+static NSString *RYRevStateText(void) { return RYRevIsDefault() ? T(@"الافتراضي ✓", @"Default ✓") : T(@"معدّل", @"Changed"); }
 static void RYIsoSave(void) { CS(@"isoSess", @(gIsoSess != 0)); CS(@"isoVP", @(gIsoVP != 0)); CS(@"isoRTC", @(gIsoRTC != 0)); }
 static void RYMicApplyPreset(int i) {
     if (i < 0 || i >= RY_NPRESETS) return; const RYPreset *p = &kPresets[i];
@@ -2021,7 +2030,6 @@ static void RYMsgLoopSet(BOOL on) {
 - (void)renderLocked {
     __weak typeof(self) ws = self;
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"اللوحة مقفلة", @"Panel is locked"), 17, UIFontWeightBold, nil),
-        RYLabel(T(@"اكتب المفتاح مرة وحدة عشان تفتحها.", @"Type your key once to unlock."), 14, UIFontWeightRegular, RY_MUTED),
         RYBtn(T(@"فتح", @"Unlock"), YES, ^{
             [ws ask:T(@"المفتاح", @"Key") ph:@"" secure:YES ok:^(NSString *s) {
                 if ([RYHash(s) isEqualToString:CF(@"keyHash", @"")]) { CS(@"unlocked", @YES); [ws rebuild]; }
@@ -2101,8 +2109,7 @@ static void RYMsgLoopSet(BOOL on) {
 - (void)renderInvites {
     __weak typeof(self) ws = self;
     [self.stack addArrangedSubview:RYCard(@[
-        RYLabel(T(@"دعوة كل اللي بالقائمة", @"Invite everyone in the list"), 16, UIFontWeightBold, nil),
-        RYLabel(T(@"افتح شاشة الدعوات (الريسنت أو الأصدقاء) في Rave، وخلّها ظاهرة، وبعدين اضغط ابدأ. يحدد الدايرة لكل شخص، وبعد آخر واحد يضغط زر الإرسال. ما يعيد لنفس الناس.", @"Open the Recents (or Friends) screen in Rave and keep it visible, then press Start. It goes through each person once and stops. It never re-sends to the same people."), 13, UIFontWeightRegular, RY_MUTED)])];
+        RYLabel(T(@"دعوة كل اللي بالقائمة", @"Invite everyone in the list"), 16, UIFontWeightBold, nil)])];
     self.invLabel = RYLabel([self invText], 14, UIFontWeightMedium, nil);
     UIButton *go = RYBtn(T(@"ابدأ الدعوات", @"Start invites"), YES, ^{
         RYCore *c = [RYCore shared];
@@ -2115,7 +2122,6 @@ static void RYMsgLoopSet(BOOL on) {
     });
     UIButton *stop = RYBtn(T(@"إيقاف", @"Stop"), NO, ^{ [[RYCore shared] stopInvites]; });
     [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYHStack(@[go, stop], 8)])];
-    [self.stack addArrangedSubview:RYLabel(T(@"ملاحظة: يعتمد على أزرار الدعوة الموجودة بالشاشة. لو ما اشتغل انسخ \"تقرير تشخيصي\" من الإعدادات وأرسله لي.", @"Note: it drives the invite buttons that are on screen. If nothing happens, copy the diagnostic report from Settings and send it to me."), 12, UIFontWeightRegular, RY_MUTED)];
     [self startInvUI];
 }
 - (void)startInvUI {
@@ -2134,13 +2140,12 @@ static void RYMsgLoopSet(BOOL on) {
         RYMsgLoopSet(wlp.on);
     }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"إرسال كل الرسائل بتكرار", @"Loop all messages"), 15, UIFontWeightBold, nil), lp], 12),
-        RYLabel(T(@"يرسل رسائلك وحدة بعد وحدة لين تطفي الزر. يكمّل حتى لو طلعت من التطبيق طالما أنت داخل الروم، ويوقف لحاله لو طلعت من الروم. الغرف ممكن تكتمك لو كثّرت.", @"Sends your messages one after another until switched off. Keeps going when you leave the app as long as you stay in the room; stops if you leave the room. Rooms may mute you for flooding."), 12, UIFontWeightRegular, RY_MUTED), lst])];
+        lst])];
     [self.stack addArrangedSubview:RYSlider(T(@"الفاصل بين الرسائل (ثواني)", @"Delay between messages (seconds)"), 2, 15, [CF(@"msgDelay", @4.0) floatValue], ^(float v) { CS(@"msgDelay", @(v)); })];
     self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
         ws.invLabel.text = gMsgLoop ? [NSString stringWithFormat:T(@"شغّال... انرسل %lu", @"Running... sent %lu"), (unsigned long)gMsgSent] : T(@"متوقف", @"Stopped");
         if (!gMsgLoop && wlp.on) wlp.on = NO;
     }];
-    [self.stack addArrangedSubview:RYLabel(T(@"اضغط على الرسالة لإرسالها مرة وحدة للدردشة.", @"Tap a message to send it once to the room chat."), 13, UIFontWeightRegular, RY_MUTED)];
     for (NSUInteger i = 0; i < msgs.count; i++) {
         NSString *m = msgs[i];
         UIButton *send = RYBtn(m, YES, ^{
@@ -2183,7 +2188,6 @@ static void RYMsgLoopSet(BOOL on) {
 }
 - (void)renderJoin {
     __weak typeof(self) ws = self;
-    [self.stack addArrangedSubview:RYLabel(T(@"في النسخة المعدّلة الروابط ما تفتح التطبيق لما تضغط عليها (بسبب التوقيع). انسخ رابط الروم وادخل من هنا.", @"In the modded build tapped links don't open the app (signing drops Universal Links). Copy the room link and join from here."), 13, UIFontWeightRegular, RY_MUTED)];
     UIButton *paste = RYBtn(T(@"لصق من الحافظة ودخول", @"Paste & join"), YES, ^{ [ws joinFrom:UIPasteboard.generalPasteboard.string]; });
     UIButton *type = RYBtn(T(@"كتابة الرابط", @"Type link"), NO, ^{
         [ws ask:T(@"رابط الروم", @"Room link") ph:@"rave.link/..." secure:NO ok:^(NSString *x) { [ws joinFrom:x]; }];
@@ -2230,8 +2234,7 @@ static void RYMsgLoopSet(BOOL on) {
     __weak typeof(self) ws = self;
     UISwitch *sw = [UISwitch new]; sw.on = gMicOn != 0; sw.onTintColor = RYAccent(); __weak UISwitch *wsw = sw;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetOn(wsw.on); }] forControlEvents:UIControlEventValueChanged];
-    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تشغيل مغيّر الصوت", @"Voice changer"), 15, UIFontWeightBold, nil), sw], 12),
-        RYLabel(T(@"يغيّر صوتك اللي يسمعه اللي معك في الغرفة (أنت ما تسمعه). ادخل صوت الغرفة وافتح المايك أول.", @"Changes your voice for the others in the room (you do not hear it). Join voice and unmute first."), 13, UIFontWeightRegular, RY_MUTED)])];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تشغيل مغيّر الصوت", @"Voice changer"), 15, UIFontWeightBold, nil), sw], 12)])];
     NSMutableArray *bs = [NSMutableArray new];
     for (int i = 0; i < RY_NPRESETS; i++) {
         NSString *nm = [NSString stringWithUTF8String:RYAr() ? kPresets[i].ar : kPresets[i].en];
@@ -2247,15 +2250,12 @@ static void RYMsgLoopSet(BOOL on) {
     [s2 addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetRev(ws2.on); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"فضي", @"Silver"), 15, UIFontWeightBold, nil),
         RYHStack(@[RYLabel(T(@"مضخم", @"Amplifier"), 14, UIFontWeightMedium, nil), s1], 12),
-        RYHStack(@[RYLabel(T(@"صدى فضي", @"Silver echo"), 14, UIFontWeightMedium, nil), s2], 12),
-        RYLabel(T(@"مضخم: تضخيم وتشويه قوي (نفس Plus Distortion على الأخير). صدى فضي: صدى غرفة كبيرة وطويلة (نفس Dragonfly Room Reverb على الأخير). يشتغلون حتى لو مغيّر الصوت مطفي، وفوق الصوت المختار لو شغّال، وتقدر تفعّل الاثنين مع بعض.", @"Amplifier: heavy gain and distortion (Plus Distortion at maximum). Silver echo: large, long room reverb (Dragonfly Room Reverb at maximum). They work even when the voice changer is off, sit on top of the chosen voice when it is on, and can be combined."), 12, UIFontWeightRegular, RY_MUTED)])];
+        RYHStack(@[RYLabel(T(@"صدى فضي", @"Silver echo"), 14, UIFontWeightMedium, nil), s2], 12)])];
     UISwitch *s3 = [UISwitch new]; s3.on = gMonOn != 0; s3.onTintColor = RYAccent(); __weak UISwitch *ws3 = s3;
     [s3 addAction:[UIAction actionWithHandler:^(UIAction *a) { if (ws3.on) RYMonStart(); else RYMonStop(); }] forControlEvents:UIControlEventValueChanged];
-    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"اسمع صوتي", @"Hear my voice"), 15, UIFontWeightBold, nil), s3], 12),
-        RYLabel(T(@"يسمّعك صوتك بنفس الشكل اللي يسمعونه في الغرفة (بعد التغيير والمؤثرات). استخدم سماعة، وإلا المايك يلقط الصوت من السماعة ويصير صفير.", @"Plays your voice back exactly as the others hear it (after the voice and effects). Use headphones, or the mic picks it up and howls."), 12, UIFontWeightRegular, RY_MUTED)])];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"اسمع صوتي", @"Hear my voice"), 15, UIFontWeightBold, nil), s3], 12)])];
         // ---- amplifier settings
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إعدادات المضخم", @"Amplifier settings"), 15, UIFontWeightBold, nil),
-        RYLabel(T(@"التضخيم من +60 dB وفوق. كل ما زاد التضخيم صار الصوت أقوى وأكثر تشويه. عتبة الكتم تمنع تضخيم ضجيج الغرفة لما ما تتكلم.", @"Gain starts at +60 dB. More gain = louder and more distorted. The gate stops room noise from being amplified while you are silent."), 12, UIFontWeightRegular, RY_MUTED)])];
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إعدادات المضخم", @"Amplifier settings"), 15, UIFontWeightBold, nil)])];
     [self.stack addArrangedSubview:RYSliderV(T(@"التضخيم", @"Gain"), @"dB", 60, 120, [CF(@"distDb", @60) floatValue], NO, 0, ^(float v) { gDistGain = powf(10.f, v / 20.f); CS(@"distDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"مستوى الخروج", @"Output"), @"dB", -30, 0, [CF(@"distOutDb", @-3) floatValue], NO, 0, ^(float v) { gDistOut = powf(10.f, v / 20.f); CS(@"distOutDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"عتبة الكتم", @"Gate"), @"dB", -80, -30, [CF(@"distGateDb", @-55) floatValue], NO, 0, ^(float v) { gDistGate = powf(10.f, v / 20.f); CS(@"distGateDb", @(v)); })];
@@ -2263,7 +2263,6 @@ static void RYMsgLoopSet(BOOL on) {
     UILabel *rvState = RYLabel(RYRevStateText(), 12, UIFontWeightMedium, RY_MUTED); __weak UILabel *wst = rvState;
     void (^rvReset)(void) = ^{ for (int i = 0; i < RV_N; i++) gRv[i] = kRvDef[i]; RYRevSave(); [ws rebuild]; [ws toast:T(@"رجعت القيم الافتراضية", @"Defaults restored")]; };
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إعدادات الصدى (Dragonfly)", @"Echo settings (Dragonfly)"), 15, UIFontWeightBold, nil),
-        RYLabel(T(@"الافتراضي دايماً هو قيم Dragonfly Room Reverb اللي بالصورة: الصوت الأصلي 46%، المبكر 69%، الإرسال 69%، الذيل 69%، الحجم 32، التأخير 100ms، المدة 10s، الانتشار 0، التذبذب 0، التجوال 40%، القطع 16000/16000/9400، الأدنى 137Hz، التعزيز 100% عند 600Hz. (العرض Width ما فيه لأن الصوت أحادي.)", @"The default is always the Dragonfly Room Reverb values from the screenshot. (Width is left out: a voice is mono.)"), 12, UIFontWeightRegular, RY_MUTED),
         rvState, RYBtn(T(@"رجّع الافتراضي", @"Reset to default"), YES, rvReset)])];
     struct { int i; const char *ar, *en, *u; float mn, mx; BOOL lg; int d; } rv[] = {
         {RV_DRY, "الصوت الأصلي", "Dry Level", "%", 0, 100, NO, 0}, {RV_ELVL, "الانعكاسات المبكرة", "Early Level", "%", 0, 100, NO, 0},
@@ -2290,8 +2289,7 @@ static void RYMsgLoopSet(BOOL on) {
         RYHStack(@[RYLabel(T(@"كل العوازل", @"All"), 14, UIFontWeightMedium, nil), RYBtn(T(@"شغّل الكل", @"All on"), YES, ^{ gIsoSess = gIsoVP = gIsoRTC = 1; RYIsoSave(); RYIsoApplySession(); [ws rebuild]; }), RYBtn(T(@"طفّ الكل", @"All off"), NO, ^{ gIsoSess = gIsoVP = gIsoRTC = 0; RYIsoSave(); [ws rebuild]; })], 8),
         RYHStack(@[RYLabel(T(@"وضع الجلسة (بدون صدى/ضجيج النظام)", @"Session mode (no system voice processing)"), 13, UIFontWeightRegular, nil), i1], 12),
         RYHStack(@[RYLabel(T(@"معالج الصوت VPIO (صدى، ضجيج، AGC)", @"VPIO audio unit (echo, noise, AGC)"), 13, UIFontWeightRegular, nil), i2], 12),
-        RYHStack(@[RYLabel(T(@"معالجة WebRTC (ضجيج، صدى، AGC)", @"WebRTC processing (noise, echo, AGC)"), 13, UIFontWeightRegular, nil), i3], 12),
-        RYLabel(T(@"بعد التفعيل اطلع من صوت الغرفة وادخل من جديد عشان يتطبق. بدون معالجة النظام لازم تستخدم سماعة وإلا يرجع لك صوتك صدى.", @"After switching, leave voice and join again so it takes effect. Without system processing use headphones or your own voice echoes back."), 12, UIFontWeightRegular, RY_MUTED)])];
+        RYHStack(@[RYLabel(T(@"معالجة WebRTC (ضجيج، صدى، AGC)", @"WebRTC processing (noise, echo, AGC)"), 13, UIFontWeightRegular, nil), i3], 12)])];
     self.invLabel = RYLabel(RYMicStatus2(), 13, UIFontWeightMedium, RY_MUTED);
     [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYBtn(T(@"نسخ تشخيص المايك", @"Copy mic diagnostics"), NO, ^{ UIPasteboard.generalPasteboard.string = RYMicReport(); [ws toast:T(@"اننسخ", @"Copied")]; })])];
     [self.invUI invalidate];
@@ -2323,7 +2321,7 @@ static void RYMsgLoopSet(BOOL on) {
     UISwitch *ad = [UISwitch new]; ad.on = gAntiDel; ad.onTintColor = RYAccent(); __weak UISwitch *wad = ad;
     [ad addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetAntiDelete(wad.on); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"منع حذف الرسائل الخاصة (عندك بس)", @"Keep deleted private messages (local only)"), 14, UIFontWeightMedium, nil), ad], 12),
-        RYLabel([NSString stringWithFormat:T(@"يشتغل بعد إعادة فتح التطبيق. محجوز: %d | صور محقونة: %d", @"Applies after relaunch. Blocked: %d | hooked images: %d"), gAntiDelBlocked, gAntiDelImages], 12, UIFontWeightRegular, RY_MUTED)])];
+        RYLabel([NSString stringWithFormat:T(@"محجوز: %d | صور محقونة: %d", @"Blocked: %d | hooked images: %d"), gAntiDelBlocked, gAntiDelImages], 12, UIFontWeightRegular, RY_MUTED)])];
 
     UISwitch *rd = [UISwitch new]; rd.on = gMarkRed; rd.onTintColor = RYAccent(); __weak UISwitch *wrd = rd;
     [rd addAction:[UIAction actionWithHandler:^(UIAction *a) { RYSetMarkRed(wrd.on); }] forControlEvents:UIControlEventValueChanged];
@@ -2333,7 +2331,6 @@ static void RYMsgLoopSet(BOOL on) {
         RYBtn(T(@"مسح قائمة المحذوفة", @"Clear deleted list"), NO, ^{ RYClearDeleted(); [ws rebuild]; [ws toast:T(@"انمسحت", @"Cleared")]; })])];
 
     NSMutableArray *key = [NSMutableArray arrayWithObject:RYLabel(T(@"مفتاح الفتح", @"Unlock key"), 15, UIFontWeightBold, nil)];
-    [key addObject:RYLabel(T(@"يتخزن الهاش (SHA-256) فقط، مو المفتاح نفسه.", @"Only the SHA-256 hash is stored, never the key."), 13, UIFontWeightRegular, RY_MUTED)];
     [key addObject:RYBtn(T(@"تعيين / تغيير المفتاح", @"Set / change key"), NO, ^{
         [ws ask:T(@"مفتاح جديد (3 أحرف أو أكثر)", @"New key (3+ chars)") ph:@"" secure:YES ok:^(NSString *s) {
             if (s.length < 3) { [ws toast:T(@"المفتاح قصير", @"Key too short")]; return; }
@@ -2347,7 +2344,6 @@ static void RYMsgLoopSet(BOOL on) {
         RYHStack(@[RYBtn(T(@"تصدير (نسخ)", @"Export (copy)"), NO, ^{ [ws exportCfg]; }), RYBtn(T(@"استيراد (من الحافظة)", @"Import (clipboard)"), NO, ^{ [ws importCfg]; })], 8)])];
 
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"متقدم (للضبط)", @"Advanced (tuning)"), 15, UIFontWeightBold, nil),
-        RYLabel(T(@"لو الزر ما يظهر بالغرفة أو الشعار ما تغيّر، استخدم هذي.", @"If the button doesn't show in a room or the logo isn't replaced, use these."), 13, UIFontWeightRegular, RY_MUTED),
         RYBtn(T(@"نسخ قائمة الشاشات", @"Copy screen list"), NO, ^{
             NSMutableString *o = [NSMutableString new]; for (UIWindow *w in RYAppWindows()) RYDump(w.rootViewController, 0, o);
             UIPasteboard.generalPasteboard.string = o; [ws toast:T(@"اننسخت قائمة الشاشات", @"Screen list copied")];
