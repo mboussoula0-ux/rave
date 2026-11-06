@@ -136,6 +136,17 @@ static UIView *RYSlider(NSString *title, float mn, float mx, float val, void (^c
     [s addAction:[UIAction actionWithHandler:^(UIAction *a) { if (ws && chg) chg(ws.value); }] forControlEvents:UIControlEventValueChanged];
     return RYCard(@[l, s]);
 }
+static UIView *RYSliderV(NSString *title, NSString *unit, float mn, float mx, float val, BOOL logScale, int dec, void (^chg)(float)) {
+    UILabel *l = RYLabel(@"", 14, UIFontWeightMedium, nil);
+    UISlider *s = [UISlider new]; s.minimumTrackTintColor = RYAccent(); s.minimumValue = 0; s.maximumValue = 1;
+    float (^toS)(float) = ^float(float v) { if (v < mn) v = mn; if (v > mx) v = mx; return logScale ? (logf(v) - logf(mn)) / (logf(mx) - logf(mn)) : (v - mn) / (mx - mn); };
+    float (^fromS)(float) = ^float(float t) { float v = logScale ? expf(logf(mn) + t * (logf(mx) - logf(mn))) : mn + t * (mx - mn); return dec == 0 ? roundf(v) : v; };
+    NSString *(^txt)(float) = ^NSString *(float v) { return [NSString stringWithFormat:@"%@: %.*f %@", title, dec, v, unit]; };
+    s.value = toS(val); l.text = txt(val);
+    __weak UISlider *ws = s; __weak UILabel *wl = l;
+    [s addAction:[UIAction actionWithHandler:^(UIAction *a) { if (!ws) return; float v = fromS(ws.value); wl.text = txt(v); if (chg) chg(v); }] forControlEvents:UIControlEventValueChanged];
+    return RYCard(@[l, s]);
+}
 static UIView *RYGrid(NSArray *views, int cols) {
     NSMutableArray *rows = [NSMutableArray new];
     for (NSUInteger i = 0; i < views.count; i += cols) {
@@ -1124,17 +1135,83 @@ static volatile int gMicOn = 0, gMicMode = 0, gMicPreset = 0;
 static volatile float gMicSemi = 0, gMicEcho = 0, gMicGain = 1;
 static volatile long long gMicCallsA = 0, gMicCallsU = 0, gMicCallsT = 0, gMicProc = 0;
 static volatile int gMicRebound = 0, gMicWrapped = 0, gMicTapInst = 0;
+static volatile int gMicDist = 0, gMicRev = 0, gMonOn = 0;
+enum { RV_DRY, RV_ELVL, RV_ESEND, RV_LLVL, RV_SIZE, RV_PRE, RV_DECAY, RV_DIFF, RV_SPIN, RV_WANDER, RV_HC, RV_EDAMP, RV_LDAMP, RV_LC, RV_LB, RV_BF, RV_N };
+static const float kRvDef[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600}; // the Dragonfly Room Reverb values from the screenshot
+static volatile float gRv[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600};
+static volatile float gDistGain = 1000.f, gDistOut = 0.7f, gDistGate = 0.0018f; // amplifier: +60 dB, -3 dB out, gate at -55 dB
 static char gMicFmt[96] = "-"; static char gMicLast[200] = "-"; static volatile long long gMicSkip = 0; static volatile double gMicHWRate = 48000;
 
 #define RYM_BUF 8192      // pitch history (power of two)
 #define RYM_ECHO 32768    // echo line (power of two)
-typedef struct { float hist[RYM_BUF]; unsigned w; float d0, d1; float eb[RYM_ECHO]; unsigned ew; float ph, hpx, hpy, lp; double sr; } RYVS;
+typedef struct {
+    float hist[RYM_BUF]; unsigned w; float d0, d1; float eb[RYM_ECHO]; unsigned ew; float ph, hpx, hpy, lp; double sr;
+    float dcx, dcy, dlp, env;                                        // "amplifier" (distortion) state
+    float cb[8][4096]; unsigned ci[8]; float cf[8]; float ab[4][1024]; unsigned ai[4]; // room reverb: 8 combs + 4 all-passes
+    float pre[16384]; unsigned pw; float er[8192]; unsigned erw;      // pre-delay + early reflections
+    float rlc, elp, olp, blp, lfo;                                    // reverb filters + modulation
+} RYVS;
 static RYVS gVS[3]; // 0 = AudioUnitRender, 1 = AUAudioUnit block, 2 = AVAudioEngine tap (separate state: they may run at the same time)
 
+
+// ---- "Silver" effects. Windows VST plugins cannot run on an iPhone, so the same two effects are built in natively.
+// amplifier (Plus Distortion style: input gain -> saturation -> output gain). The gain is at least +60 dB, so a gate keeps the room noise from being blown up.
+static inline float RYDist(float x, RYVS *s) {
+    float a = fabsf(x); s->env = a > s->env ? a : s->env * 0.9997f;
+    float thr = gDistGate, gate = s->env < thr ? s->env / thr : 1.f; gate *= gate;      // below the threshold the input fades out
+    float v = x * gDistGain;
+    float y = 0.7f * tanhf(v * 2.2f + 0.1f) + 0.3f * fmaxf(-1.f, fminf(1.f, v * 3.f));
+    float hp = y - s->dcx + 0.995f * s->dcy; s->dcx = y; s->dcy = hp;                  // DC blocker (the asymmetric clipping adds an offset)
+    s->dlp += 0.55f * (hp - s->dlp);                                                    // takes the harshest fizz off
+    return s->dlp * gDistOut * gate;
+}
+// room reverb modelled on Dragonfly Room Reverb (Freeverb3 style): early reflections + a late tail made of 8 combs and 4 all-passes.
+// The coefficients are worked out once per audio block from the user's settings.
+typedef struct { int L[8], apL[4], etl[8], pd; float fb[8], ld, ed, hc, lc, bf, apg, wdepth, spininc, dry, elv, esend, llv, lb; } RYRevC;
+static const int kRvComb[8] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617}, kRvAp[4] = {556, 441, 341, 225};
+static const float kRvEt[8] = {0.007f, 0.011f, 0.017f, 0.023f, 0.031f, 0.041f, 0.053f, 0.067f}, kRvEg[8] = {.7f, .6f, .5f, .45f, .4f, .35f, .3f, .25f};
+static inline float RYPole(float hz, double sr) { if (hz > 0.45f * (float)sr) hz = 0.45f * (float)sr; if (hz < 1.f) hz = 1.f; return expf(-6.2831853f * hz / (float)sr); }
+static void RYRevPrep(RYRevC *c, double sr) {
+    const float k = (float)(sr / 44100.0), sz = fmaxf(0.25f, gRv[RV_SIZE] / 32.f), decay = fmaxf(0.1f, gRv[RV_DECAY]);
+    for (int i = 0; i < 8; i++) {
+        int L = (int)(kRvComb[i] * k * sz); if (L > 4000) L = 4000; if (L < 32) L = 32; c->L[i] = L;
+        float fb = powf(10.f, -3.f * (float)L / ((float)sr * decay)); c->fb[i] = fb > 0.9995f ? 0.9995f : fb;  // feedback that gives the chosen decay time (RT60)
+        int e = (int)(kRvEt[i] * sz * (float)sr); c->etl[i] = e > 8190 ? 8190 : e;
+    }
+    for (int i = 0; i < 4; i++) { int L = (int)(kRvAp[i] * k); if (L > 1000) L = 1000; if (L < 8) L = 8; c->apL[i] = L; }
+    int pd = (int)(gRv[RV_PRE] * 0.001 * sr); c->pd = pd > 16383 ? 16383 : (pd < 0 ? 0 : pd);
+    c->ld = RYPole(gRv[RV_LDAMP], sr); c->ed = RYPole(gRv[RV_EDAMP], sr); c->hc = RYPole(gRv[RV_HC], sr); c->lc = RYPole(gRv[RV_LC], sr); c->bf = RYPole(gRv[RV_BF], sr);
+    c->apg = 0.1f + 0.7f * gRv[RV_DIFF] * 0.01f; c->wdepth = gRv[RV_WANDER] * 0.01f * 24.f * k; c->spininc = 6.2831853f * gRv[RV_SPIN] / (float)sr;
+    c->dry = gRv[RV_DRY] * 0.01f; c->elv = gRv[RV_ELVL] * 0.01f * 0.3f; c->esend = gRv[RV_ESEND] * 0.01f; c->llv = gRv[RV_LLVL] * 0.01f * 3.f; c->lb = gRv[RV_LB] * 0.01f;
+}
+static inline float RYRev(float x, RYVS *s, const RYRevC *c) {
+    s->rlc = x * (1.f - c->lc) + s->rlc * c->lc; float xi = x - s->rlc;                  // low cut on what goes into the reverb
+    s->pre[s->pw & 16383] = xi; float pin = s->pre[(s->pw - (unsigned)c->pd) & 16383]; s->pw++;
+    s->er[s->erw & 8191] = xi; float e = 0;
+    for (int j = 0; j < 8; j++) e += s->er[(s->erw - (unsigned)c->etl[j]) & 8191] * kRvEg[j];
+    s->erw++; s->elp = e * (1.f - c->ed) + s->elp * c->ed; e = s->elp;                  // early damp
+    float in = (pin + e * c->esend) * 0.015f, late = 0;
+    s->lfo += c->spininc; if (s->lfo > 6.2831853f) s->lfo -= 6.2831853f;
+    for (int i = 0; i < 8; i++) {
+        float Lm = (float)c->L[i]; if (c->wdepth > 0.01f && c->spininc > 0.f) Lm += c->wdepth * sinf(s->lfo + 0.8f * (float)i);
+        int Li = (int)Lm; float fr = Lm - (float)Li; unsigned wi = s->ci[i];
+        float o = s->cb[i][(wi - (unsigned)Li) & 4095] * (1.f - fr) + s->cb[i][(wi - (unsigned)Li - 1u) & 4095] * fr;
+        s->cf[i] = o * (1.f - c->ld) + s->cf[i] * c->ld;                                // late damp
+        s->cb[i][wi & 4095] = in + s->cf[i] * c->fb[i]; s->ci[i] = wi + 1; late += o;
+    }
+    for (int a = 0; a < 4; a++) {
+        unsigned wi = s->ai[a]; float b = s->ab[a][(wi - (unsigned)c->apL[a]) & 1023], o = -late + b;
+        s->ab[a][wi & 1023] = late + b * c->apg; s->ai[a] = wi + 1; late = o;
+    }
+    s->blp = late * (1.f - c->bf) + s->blp * c->bf; late += s->blp * c->lb;             // low boost
+    float wet = e * c->elv + late * c->llv;
+    s->olp = wet * (1.f - c->hc) + s->olp * c->hc;                                       // high cut
+    return x * c->dry + s->olp;
+}
 // pitch shift = two read taps on a delay line that slides at (1 - ratio) samples per sample, cross-faded with a Hann window
 static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
     if (s->sr != sr) { memset(s, 0, sizeof(RYVS)); s->sr = sr; s->d1 = (float)(0.016 * sr); }
-    const int W = (int)(0.032 * sr);
+    const int W = (int)(0.032 * sr); const int revOn = gMicRev; RYRevC rc; if (revOn) RYRevPrep(&rc, sr);
     const float semi = gMicSemi, echo = gMicEcho, gain = gMicGain; const int mode = gMicMode;
     const float dd = 1.f - powf(2.f, semi / 12.f);
     const BOOL pitch = fabsf(semi) > 0.05f;
@@ -1155,11 +1232,52 @@ static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
         }
         if (mode == 1) { float m = sinf(s->ph); s->ph += rph; if (s->ph > 6.2831853f) s->ph -= 6.2831853f; y = y * (0.25f + 0.75f * m) * 1.35f; }
         else if (mode == 2) { float hp = 0.95f * (s->hpy + y - s->hpx); s->hpx = y; s->hpy = hp; s->lp += 0.4f * (hp - s->lp); y = tanhf(s->lp * 3.0f); }
+        if (gMicDist) y = RYDist(y, s);
+        if (revOn) y = RYRev(y, s, &rc);
         if (echo > 0.01f) { float e = s->eb[(s->ew - (unsigned)ed) & (RYM_ECHO - 1)]; s->eb[s->ew & (RYM_ECHO - 1)] = y + e * 0.4f; s->ew++; y += e * echo; }
         if (y > 1.f) y = 1.f; else if (y < -1.f) y = -1.f;
         x[i] = y;
     }
 }
+// ---- monitor: hear your own processed voice (what the others hear) through the phone's output. A ring buffer is fed by the capture routes below.
+static float gMonRing[65536]; static volatile unsigned gMonW = 0, gMonR = 0; static double gMonSR = 48000; static AVAudioEngine *gMonEng;
+static void RYMonFeed(const float *x, int n, double sr) {
+    if (!gMonOn) return; gMonSR = sr; unsigned w = gMonW;
+    for (int i = 0; i < n; i++) gMonRing[(w + (unsigned)i) & 65535] = x[i];
+    __sync_synchronize(); gMonW = w + (unsigned)n;
+}
+static void RYMonStop(void) {
+    gMonOn = 0; AVAudioEngine *e = gMonEng; gMonEng = nil;
+    if (e) dispatch_async(dispatch_get_main_queue(), ^{ [e stop]; });
+}
+static void RYMonStart(void) {
+    gMonOn = 1; gMonR = gMonW;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gMonEng || !gMonOn) return;
+        AVAudioFormat *fmt = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:(gMonSR > 0 ? gMonSR : 48000) channels:1];
+        __block BOOL primed = NO;
+        AVAudioSourceNode *src = [[AVAudioSourceNode alloc] initWithFormat:fmt renderBlock:^OSStatus(BOOL *silence, const AudioTimeStamp *ts, AVAudioFrameCount frames, AudioBufferList *out) {
+            float *o = (float *)out->mBuffers[0].mData; unsigned w = gMonW, r = gMonR, avail = w - r;
+            if (!primed) { if (avail < 1200) { memset(o, 0, frames * sizeof(float)); return noErr; } primed = YES; }  // small cushion before the first sample
+            if (avail > 9600) { r = w - 2400; avail = 2400; }                                                        // fell behind: jump back to ~50 ms
+            unsigned take = avail < frames ? avail : frames;
+            for (unsigned i = 0; i < take; i++) o[i] = gMonRing[(r + i) & 65535];
+            if (take < frames) memset(o + take, 0, (frames - take) * sizeof(float));
+            gMonR = r + take; return noErr;
+        }];
+        AVAudioEngine *e = [AVAudioEngine new];
+        [e attachNode:src]; [e connect:src to:e.mainMixerNode format:fmt];
+        NSError *err = nil;
+        if (![e startAndReturnError:&err]) { RYLog(@"monitor start failed: %@", err); gMonOn = 0; return; }
+        gMonEng = e;
+        static dispatch_once_t once; dispatch_once(&once, ^{
+            [NSNotificationCenter.defaultCenter addObserverForName:AVAudioEngineConfigurationChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+                AVAudioEngine *g = gMonEng; if (gMonOn && g && !g.isRunning) [g startAndReturnError:nil];
+            }];
+        });
+    });
+}
+static inline void RYMicFx(float *t, int c, double sr, RYVS *s) { if (gMicOn) RYVoiceBlock(t, c, sr, s); if (gMonOn) RYMonFeed(t, c, sr); }
 // interleaved: channel 0 is processed and copied to the other channels
 static void RYProcInter(void *data, BOOL isFloat, UInt32 frames, UInt32 ch, double sr, RYVS *s) {
     if (!data || !ch) return; float tmp[2048]; UInt32 done = 0;
@@ -1168,12 +1286,12 @@ static void RYProcInter(void *data, BOOL isFloat, UInt32 frames, UInt32 ch, doub
         if (isFloat) {
             float *p = (float *)data + (size_t)done * ch;
             for (UInt32 j = 0; j < c; j++) tmp[j] = p[j * ch];
-            RYVoiceBlock(tmp, (int)c, sr, s);
+            RYMicFx(tmp, (int)c, sr, s);
             for (UInt32 j = 0; j < c; j++) for (UInt32 k = 0; k < ch; k++) p[j * ch + k] = tmp[j];
         } else {
             int16_t *p = (int16_t *)data + (size_t)done * ch;
             for (UInt32 j = 0; j < c; j++) tmp[j] = (float)p[j * ch] / 32768.f;
-            RYVoiceBlock(tmp, (int)c, sr, s);
+            RYMicFx(tmp, (int)c, sr, s);
             for (UInt32 j = 0; j < c; j++) { float v = tmp[j] * 32767.f; int16_t q = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : v); for (UInt32 k = 0; k < ch; k++) p[j * ch + k] = q; }
         }
         done += c;
@@ -1186,7 +1304,7 @@ static void RYProcPlanar(void **planes, UInt32 np, BOOL isFloat, UInt32 frames, 
         UInt32 c = frames - done; if (c > 2048) c = 2048;
         if (isFloat) { float *p = (float *)planes[0] + done; for (UInt32 j = 0; j < c; j++) tmp[j] = p[j]; }
         else { int16_t *p = (int16_t *)planes[0] + done; for (UInt32 j = 0; j < c; j++) tmp[j] = (float)p[j] / 32768.f; }
-        RYVoiceBlock(tmp, (int)c, sr, s);
+        RYMicFx(tmp, (int)c, sr, s);
         for (UInt32 q = 0; q < np; q++) {
             if (!planes[q]) continue;
             if (isFloat) { float *p = (float *)planes[q] + done; for (UInt32 j = 0; j < c; j++) p[j] = tmp[j]; }
@@ -1218,7 +1336,7 @@ static OSStatus RYAURender(AudioUnit u, AudioUnitRenderActionFlags *fl, const Au
     OSStatus r = orig_aurender ? orig_aurender(u, fl, ts, bus, n, io) : -50;
     if (r != noErr || bus != 1 || !io) return r;
     gMicCallsA++;
-    if (!gMicOn) return r;
+    if (!gMicOn && !gMonOn) return r;
     static AudioUnit lastU; static AudioStreamBasicDescription f; static BOOL ok;
     if (u != lastU) {
         lastU = u; UInt32 sz = sizeof f; memset(&f, 0, sizeof f);
@@ -1243,6 +1361,12 @@ static BOOL RYFmtFromAU(AUAudioUnit *au, AudioStreamBasicDescription *out) {
     } @catch (__unused id e) {}
     return NO;
 }
+// float32 audio is finite and within about +-1; int16 samples read as floats come out as NaN/huge or denormal-tiny values
+static BOOL RYLooksFloat(const float *p, UInt32 count) {
+    UInt32 bad = 0, tiny = 0; if (count > 256) count = 256;
+    for (UInt32 i = 0; i < count; i++) { float v = p[i], a = fabsf(v); if (!(a <= 4.f)) bad++; else if (a != 0.f && a < 1e-6f) tiny++; }
+    return bad == 0 && tiny == 0;
+}
 static BOOL RYFmtInfer(const AudioBufferList *io, UInt32 n, AudioStreamBasicDescription *o) {
     if (!n || !io->mNumberBuffers) return NO;
     const AudioBuffer *b0 = &io->mBuffers[0]; if (!b0->mData || b0->mDataByteSize < n || (b0->mDataByteSize % n)) return NO;
@@ -1250,6 +1374,8 @@ static BOOL RYFmtInfer(const AudioBufferList *io, UInt32 n, AudioStreamBasicDesc
     UInt32 nb = io->mNumberBuffers, per = b0->mDataByteSize / n, ch, sample;
     if (nb == 1) { ch = b0->mNumberChannels ? b0->mNumberChannels : 1; sample = per / ch; }
     else { ch = nb; sample = per; o->mFormatFlags |= kAudioFormatFlagIsNonInterleaved; }
+    if (sample == 4 && nb == 1 && !RYLooksFloat((const float *)b0->mData, MIN(n * ch, b0->mDataByteSize / 4))) { sample = 2; ch *= 2; } // really 16-bit with more channels
+    else if (sample == 4 && nb > 1 && !RYLooksFloat((const float *)b0->mData, MIN(n, b0->mDataByteSize / 4))) return NO;
     if (sample == 4) o->mFormatFlags |= kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
     else if (sample == 2) o->mFormatFlags |= kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
     else return NO;
@@ -1273,19 +1399,20 @@ static AURenderBlock RYRBGetter(id self, SEL _cmd) {
         if (r != noErr || bus != 1 || !io) return r;
         long long calls = ++gMicCallsU;
         if (calls <= 3 || calls % 2000 == 0) snprintf(gMicLast, sizeof gMicLast, "frames=%u buffers=%u b0: ch=%u bytes=%u data=%d have=%d inferred=%d", (unsigned)n, (unsigned)io->mNumberBuffers, io->mNumberBuffers ? (unsigned)io->mBuffers[0].mNumberChannels : 0, io->mNumberBuffers ? (unsigned)io->mBuffers[0].mDataByteSize : 0, io->mNumberBuffers ? io->mBuffers[0].mData != NULL : 0, cx->have, cx->inferred);
-        if (!gMicOn) return r;
-        if (!cx->have) {
+        if (!gMicOn && !gMonOn) return r;
+        AudioStreamBasicDescription f;
+        if (cx->have) f = cx->f;
+        else {
             int t = cx->tries++;
-            if (t % 100 == 0) { // ask the unit for its real format, away from the audio thread
+            if (t % 100 == 0) { // ask the unit for its real format, away from the audio thread; until then the buffer layout is used (no waiting)
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                     AUAudioUnit *au = wau; AudioStreamBasicDescription g;
                     if (au && RYFmtFromAU(au, &g)) { cx->f = g; cx->inferred = 0; cx->have = 1; RYFmtText("U", &g); }
                 });
             }
-            if (!cx->have && t >= 500) { AudioStreamBasicDescription g; if (RYFmtInfer(io, n, &g)) { cx->f = g; cx->inferred = 1; cx->have = 1; RYFmtText("U(inferred)", &g); } }
-            if (!cx->have) { gMicSkip++; return r; }
+            if (!RYFmtInfer(io, n, &f)) { gMicSkip++; return r; }
+            if (t == 0) { cx->inferred = 1; RYFmtText("U(inferred)", &f); }
         }
-        AudioStreamBasicDescription f = cx->f;
         RYMicProcessASBD(&f, n, io, &gVS[1]);
         return r;
     } copy];
@@ -1328,7 +1455,7 @@ static void RYTapInstall(id self, SEL _cmd, AVAudioNodeBus bus, AVAudioFrameCoun
     RYTapBlock w = blk;
     if (blk && [self isKindOfClass:[AVAudioInputNode class]]) {
         gMicTapInst++;
-        w = [^(AVAudioPCMBuffer *b, AVAudioTime *t) { gMicCallsT++; if (gMicOn) RYTapProcess(b); blk(b, t); } copy];
+        w = [^(AVAudioPCMBuffer *b, AVAudioTime *t) { gMicCallsT++; if (gMicOn || gMonOn) RYTapProcess(b); blk(b, t); } copy];
     }
     orig_tap(self, _cmd, bus, size, fmt, w);
 }
@@ -1338,13 +1465,72 @@ static void RYInstallTapHook(void) {
     orig_tap = (void (*)(id, SEL, AVAudioNodeBus, AVAudioFrameCount, AVAudioFormat *, RYTapBlock))method_getImplementation(m);
     method_setImplementation(m, (IMP)RYTapInstall);
 }
+
+// ---- remove Rave's audio "isolation" (system voice processing, session mode, WebRTC noise/echo/AGC) so loud or effected voice is not ducked or muted
+static volatile int gIsoSess = 0, gIsoVP = 0, gIsoRTC = 0;
+static volatile long long gIsoSessN = 0, gIsoVPN = 0, gIsoVPFail = 0, gIsoEngN = 0, gIsoRTCN = 0;
+// (1) the AVAudioSession mode: VoiceChat / VideoChat switch the system echo canceller, noise suppressor and AGC on
+static BOOL (*orig_setMode)(id, SEL, NSString *, NSError **);
+static BOOL RYSetMode(id self, SEL _cmd, NSString *m, NSError **e) { if (gIsoSess && m && ![m isEqual:AVAudioSessionModeDefault]) { gIsoSessN++; m = AVAudioSessionModeDefault; } return orig_setMode(self, _cmd, m, e); }
+static BOOL (*orig_setCatMode)(id, SEL, NSString *, NSString *, NSUInteger, NSError **);
+static BOOL RYSetCatMode(id self, SEL _cmd, NSString *c, NSString *m, NSUInteger o, NSError **e) { if (gIsoSess && m && ![m isEqual:AVAudioSessionModeDefault]) { gIsoSessN++; m = AVAudioSessionModeDefault; } return orig_setCatMode(self, _cmd, c, m, o, e); }
+static BOOL (*orig_setCatModeRS)(id, SEL, NSString *, NSString *, NSUInteger, NSUInteger, NSError **);
+static BOOL RYSetCatModeRS(id self, SEL _cmd, NSString *c, NSString *m, NSUInteger rs, NSUInteger o, NSError **e) { if (gIsoSess && m && ![m isEqual:AVAudioSessionModeDefault]) { gIsoSessN++; m = AVAudioSessionModeDefault; } return orig_setCatModeRS(self, _cmd, c, m, rs, o, e); }
+static void RYIsoApplySession(void) { if (!gIsoSess) return; dispatch_async(dispatch_get_main_queue(), ^{ [AVAudioSession.sharedInstance setMode:AVAudioSessionModeDefault error:nil]; }); }
+// (2) the voice-processing audio unit (VPIO): switch its processing off (properties 2100 = bypass, 2101 = AGC) before it initialises / starts
+static OSStatus (*orig_auinit)(AudioUnit); static OSStatus (*orig_austart)(AudioUnit);
+static void RYBypassVP(AudioUnit u) {
+    if (!gIsoVP || !u) return; UInt32 one = 1, zero = 0;
+    OSStatus a = AudioUnitSetProperty(u, 2100, kAudioUnitScope_Global, 0, &one, sizeof one);
+    AudioUnitSetProperty(u, 2101, kAudioUnitScope_Global, 0, &zero, sizeof zero);
+    if (a == noErr) gIsoVPN++; else gIsoVPFail++;
+}
+static OSStatus RYAUInit(AudioUnit u) { RYBypassVP(u); return orig_auinit ? orig_auinit(u) : -50; }
+static OSStatus RYAUStart(AudioUnit u) { RYBypassVP(u); return orig_austart ? orig_austart(u) : -50; }
+static BOOL (*orig_setVPE)(id, SEL, BOOL, NSError **);
+static BOOL RYSetVPE(id self, SEL _cmd, BOOL on, NSError **e) { if (gIsoVP && on) { gIsoEngN++; on = NO; } return orig_setVPE(self, _cmd, on, e); }
+// (3) WebRTC's own software processing: the constraints the app passes when it creates the microphone source
+static id (*orig_rtcinit)(id, SEL, NSDictionary *, NSDictionary *);
+static id RYRTCInit(id self, SEL _cmd, NSDictionary *m, NSDictionary *o) {
+    if (gIsoRTC) {
+        NSArray *keys = @[@"googEchoCancellation", @"googEchoCancellation2", @"googDAEchoCancellation", @"googAutoGainControl", @"googAutoGainControl2", @"googNoiseSuppression", @"googNoiseSuppression2", @"googHighpassFilter", @"googTypingNoiseDetection", @"echoCancellation", @"noiseSuppression", @"autoGainControl"];
+        NSMutableDictionary *mm = [m mutableCopy] ?: [NSMutableDictionary new], *oo = [o mutableCopy] ?: [NSMutableDictionary new];
+        for (NSString *k in keys) { if (mm[k]) mm[k] = @"false"; oo[k] = @"false"; }
+        gIsoRTCN++; m = mm; o = oo;
+    }
+    return orig_rtcinit(self, _cmd, m, o);
+}
+static void RYInstallIso(void) {
+    static BOOL done; if (done) return; done = YES;
+    Class S = [AVAudioSession class]; Method m;
+    if ((m = class_getInstanceMethod(S, @selector(setMode:error:)))) { orig_setMode = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSetMode); }
+    if ((m = class_getInstanceMethod(S, @selector(setCategory:mode:options:error:)))) { orig_setCatMode = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSetCatMode); }
+    if ((m = class_getInstanceMethod(S, @selector(setCategory:mode:routeSharingPolicy:options:error:)))) { orig_setCatModeRS = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSetCatModeRS); }
+    if ((m = class_getInstanceMethod([AVAudioIONode class], @selector(setVoiceProcessingEnabled:error:)))) { orig_setVPE = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSetVPE); }
+    unsigned cnt = 0; Class *all = objc_copyClassList(&cnt);
+    for (unsigned i = 0; i < cnt && !orig_rtcinit; i++) {
+        if (![NSStringFromClass(all[i]) hasSuffix:@"RTCMediaConstraints"]) continue;
+        SEL sel = NSSelectorFromString(@"initWithMandatoryConstraints:optionalConstraints:");
+        Method mm = class_getInstanceMethod(all[i], sel); if (!mm) continue;
+        orig_rtcinit = (void *)method_getImplementation(mm); method_setImplementation(mm, (IMP)RYRTCInit);
+    }
+    free(all);
+}
 // ---- settings
 static void RYMicLoad(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ double r = AVAudioSession.sharedInstance.sampleRate; if (r > 0) gMicHWRate = r; });
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicPreset = [CF(@"micPreset", @0) intValue]; gMicSemi = [CF(@"micSemi", @0) floatValue];
     gMicMode = [CF(@"micMode", @0) intValue]; gMicEcho = [CF(@"micEcho", @0) floatValue]; gMicGain = [CF(@"micGain", @1) floatValue];
+    gMicDist = [CF(@"micDist", @NO) boolValue]; gMicRev = [CF(@"micRev", @NO) boolValue];
+    { NSArray *rc = CF(@"revCfg", nil); if ([rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue]; }
+    gDistGain = powf(10.f, [CF(@"distDb", @60) floatValue] / 20.f); gDistOut = powf(10.f, [CF(@"distOutDb", @-3) floatValue] / 20.f); gDistGate = powf(10.f, [CF(@"distGateDb", @-55) floatValue] / 20.f);
+    gIsoSess = [CF(@"isoSess", @NO) boolValue]; gIsoVP = [CF(@"isoVP", @NO) boolValue]; gIsoRTC = [CF(@"isoRTC", @NO) boolValue];
 }
 static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
+static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
+static void RYMicSetRev(BOOL on) { gMicRev = on; CS(@"micRev", @(on)); }
+static void RYRevSave(void) { NSMutableArray *a = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) [a addObject:@(gRv[i])]; CS(@"revCfg", a); }
+static void RYIsoSave(void) { CS(@"isoSess", @(gIsoSess != 0)); CS(@"isoVP", @(gIsoVP != 0)); CS(@"isoRTC", @(gIsoRTC != 0)); }
 static void RYMicApplyPreset(int i) {
     if (i < 0 || i >= RY_NPRESETS) return; const RYPreset *p = &kPresets[i];
     gMicPreset = i; gMicSemi = p->semi; gMicMode = p->mode; gMicEcho = p->echo;
@@ -1357,9 +1543,13 @@ static NSString *RYMicStatus(void) {
     if (!gMicOn) return [NSString stringWithFormat:T(@"المايك مرصود ✓ (مسار %@)، المغيّر مطفي.", @"Microphone detected ✓ (route %@), changer is off."), route];
     return [NSString stringWithFormat:T(@"يشتغل ✓ (مسار %@، إطارات معالجة: %lld)", @"Working ✓ (route %@, frames processed: %lld)"), route, (long long)gMicProc];
 }
+static NSString *RYMicStatus2(void) {
+    NSString *iso = (gIsoSess || gIsoVP || gIsoRTC) ? [NSString stringWithFormat:T(@"\nإزالة العوازل: جلسة %lld، VPIO %lld (فشل %lld)، WebRTC %lld", @"\nIsolation removal: session %lld, VPIO %lld (failed %lld), WebRTC %lld"), gIsoSessN, gIsoVPN, gIsoVPFail, gIsoRTCN] : @"";
+    return [RYMicStatus() stringByAppendingString:iso];
+}
 static NSString *RYMicReport(void) {
-    return [NSString stringWithFormat:@"mic voice changer\non=%d preset=%d semi=%.1f mode=%d echo=%.2f gain=%.2f\nroute A (AudioUnitRender bus 1): calls=%lld, images rebound=%d\nroute U (AUAudioUnit renderBlock): calls=%lld, blocks wrapped=%d\nroute T (AVAudioEngine input tap): calls=%lld, taps installed=%d\nframes processed=%lld (skipped calls=%lld)\nformat=%s\nlast buffer: %s\nhw sample rate=%.0f\n",
-        gMicOn, gMicPreset, gMicSemi, gMicMode, gMicEcho, gMicGain, gMicCallsA, gMicRebound, gMicCallsU, gMicWrapped, gMicCallsT, gMicTapInst, (long long)gMicProc, (long long)gMicSkip, gMicFmt, gMicLast, gMicHWRate];
+    return [NSString stringWithFormat:@"mic voice changer\non=%d preset=%d semi=%.1f mode=%d echo=%.2f gain=%.2f dist=%d reverb=%d monitor=%d\nroute A (AudioUnitRender bus 1): calls=%lld, images rebound=%d\nroute U (AUAudioUnit renderBlock): calls=%lld, blocks wrapped=%d\nroute T (AVAudioEngine input tap): calls=%lld, taps installed=%d\nframes processed=%lld (skipped calls=%lld)\nformat=%s\nlast buffer: %s\nhw sample rate=%.0f\nisolation removal: session=%d (forced %lld) vpio=%d (bypassed %lld, failed %lld, engine %lld) webrtc=%d (rewritten %lld)\n",
+        gMicOn, gMicPreset, gMicSemi, gMicMode, gMicEcho, gMicGain, gMicDist, gMicRev, gMonOn, gMicCallsA, gMicRebound, gMicCallsU, gMicWrapped, gMicCallsT, gMicTapInst, (long long)gMicProc, (long long)gMicSkip, gMicFmt, gMicLast, gMicHWRate, gIsoSess, gIsoSessN, gIsoVP, gIsoVPN, gIsoVPFail, gIsoEngN, gIsoRTC, gIsoRTCN];
 }
 
 // minimal symbol-pointer rebinding (same idea as fishhook)
@@ -1401,6 +1591,8 @@ static void RYRebindImage(const struct mach_header *mh, intptr_t slide) {
                 if (strcmp(nm, "_sqlite3_prepare_v2") == 0) { rep = (void *)RYPrep2; save = (void **)&orig_prepare_v2; }
                 else if (strcmp(nm, "_sqlite3_prepare_v3") == 0) { rep = (void *)RYPrep3; save = (void **)&orig_prepare_v3; }
                 else if (strcmp(nm, "_sqlite3_step") == 0) { rep = (void *)RYStep; save = (void **)&orig_step; }
+                else if (strcmp(nm, "_AudioUnitInitialize") == 0) { rep = (void *)RYAUInit; save = (void **)&orig_auinit; }
+                else if (strcmp(nm, "_AudioOutputUnitStart") == 0) { rep = (void *)RYAUStart; save = (void **)&orig_austart; }
                 else if (strcmp(nm, "_AudioUnitRender") == 0) { rep = (void *)RYAURender; save = (void **)&orig_aurender; if (slots[k] != rep) gMicRebound++; }
                 else continue;
                 if (slots[k] == rep) continue;
@@ -1564,7 +1756,7 @@ static void RYInstallRebind(void) {
     _dyld_register_func_for_add_image(RYRebindImage); // calls back for every loaded image now and for later ones
 }
 static void RYInstallMic(void) {
-    RYMicLoad(); RYInstallRebind(); RYInstallTapHook(); RYInstallRB();
+    RYMicLoad(); RYInstallRebind(); RYInstallTapHook(); RYInstallRB(); RYInstallIso(); RYIsoApplySession();
     for (NSNumber *sec in @[@2, @6, @15]) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ RYInstallRB(); }); // AU classes may load late
 }
 static void RYInstallAntiDelete(void) {
@@ -2043,10 +2235,58 @@ static void RYMsgLoopSet(BOOL on) {
     [self.stack addArrangedSubview:RYSlider(T(@"درجة الصوت (نغمات)", @"Pitch (semitones)"), -12, 12, gMicSemi, ^(float v) { gMicSemi = v; gMicPreset = -1; CS(@"micSemi", @(v)); CS(@"micPreset", @(-1)); })];
     [self.stack addArrangedSubview:RYSlider(T(@"الصدى", @"Echo"), 0, 1, gMicEcho, ^(float v) { gMicEcho = v; CS(@"micEcho", @(v)); })];
     [self.stack addArrangedSubview:RYSlider(T(@"مستوى المايك", @"Mic level"), 0.5, 2, gMicGain, ^(float v) { gMicGain = v; CS(@"micGain", @(v)); })];
-    self.invLabel = RYLabel(RYMicStatus(), 13, UIFontWeightMedium, RY_MUTED);
+    UISwitch *s1 = [UISwitch new]; s1.on = gMicDist != 0; s1.onTintColor = RYAccent(); __weak UISwitch *ws1 = s1;
+    [s1 addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetDist(ws1.on); }] forControlEvents:UIControlEventValueChanged];
+    UISwitch *s2 = [UISwitch new]; s2.on = gMicRev != 0; s2.onTintColor = RYAccent(); __weak UISwitch *ws2 = s2;
+    [s2 addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetRev(ws2.on); }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"فضي", @"Silver"), 15, UIFontWeightBold, nil),
+        RYHStack(@[RYLabel(T(@"مضخم", @"Amplifier"), 14, UIFontWeightMedium, nil), s1], 12),
+        RYHStack(@[RYLabel(T(@"صدى مضخم", @"Big echo"), 14, UIFontWeightMedium, nil), s2], 12),
+        RYLabel(T(@"مضخم: تضخيم وتشويه قوي (نفس Plus Distortion على الأخير). صدى مضخم: صدى غرفة كبيرة وطويلة (نفس Dragonfly Room Reverb على الأخير). يشتغلون فوق الصوت المختار، وتقدر تفعّل الاثنين مع بعض.", @"Amplifier: heavy gain and distortion (Plus Distortion at maximum). Big echo: large, long room reverb (Dragonfly Room Reverb at maximum). They sit on top of the chosen voice and can be combined."), 12, UIFontWeightRegular, RY_MUTED)])];
+    UISwitch *s3 = [UISwitch new]; s3.on = gMonOn != 0; s3.onTintColor = RYAccent(); __weak UISwitch *ws3 = s3;
+    [s3 addAction:[UIAction actionWithHandler:^(UIAction *a) { if (ws3.on) RYMonStart(); else RYMonStop(); }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"اسمع صوتي", @"Hear my voice"), 15, UIFontWeightBold, nil), s3], 12),
+        RYLabel(T(@"يسمّعك صوتك بنفس الشكل اللي يسمعونه في الغرفة (بعد التغيير والمؤثرات). استخدم سماعة، وإلا المايك يلقط الصوت من السماعة ويصير صفير.", @"Plays your voice back exactly as the others hear it (after the voice and effects). Use headphones, or the mic picks it up and howls."), 12, UIFontWeightRegular, RY_MUTED)])];
+        // ---- amplifier settings
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إعدادات المضخم", @"Amplifier settings"), 15, UIFontWeightBold, nil),
+        RYLabel(T(@"التضخيم من +60 dB وفوق. كل ما زاد التضخيم صار الصوت أقوى وأكثر تشويه. عتبة الكتم تمنع تضخيم ضجيج الغرفة لما ما تتكلم.", @"Gain starts at +60 dB. More gain = louder and more distorted. The gate stops room noise from being amplified while you are silent."), 12, UIFontWeightRegular, RY_MUTED)])];
+    [self.stack addArrangedSubview:RYSliderV(T(@"التضخيم", @"Gain"), @"dB", 60, 120, [CF(@"distDb", @60) floatValue], NO, 0, ^(float v) { gDistGain = powf(10.f, v / 20.f); CS(@"distDb", @(v)); })];
+    [self.stack addArrangedSubview:RYSliderV(T(@"مستوى الخروج", @"Output"), @"dB", -30, 0, [CF(@"distOutDb", @-3) floatValue], NO, 0, ^(float v) { gDistOut = powf(10.f, v / 20.f); CS(@"distOutDb", @(v)); })];
+    [self.stack addArrangedSubview:RYSliderV(T(@"عتبة الكتم", @"Gate"), @"dB", -80, -30, [CF(@"distGateDb", @-55) floatValue], NO, 0, ^(float v) { gDistGate = powf(10.f, v / 20.f); CS(@"distGateDb", @(v)); })];
+    // ---- room reverb settings (every control of Dragonfly Room Reverb that matters for a mono voice)
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إعدادات الصدى (Dragonfly)", @"Echo settings (Dragonfly)"), 15, UIFontWeightBold, nil),
+        RYLabel(T(@"نفس خانات Dragonfly Room Reverb. القيم الأولية هي اللي بالصورة. (العرض Width ما فيه لأن الصوت أحادي.)", @"Same controls as Dragonfly Room Reverb; the starting values are the ones from your screenshot. (Width is left out: a voice is mono.)"), 12, UIFontWeightRegular, RY_MUTED),
+        RYBtn(T(@"رجّع القيم الأولية", @"Reset to the screenshot values"), NO, ^{ for (int i = 0; i < RV_N; i++) gRv[i] = kRvDef[i]; RYRevSave(); [ws rebuild]; })])];
+    struct { int i; const char *ar, *en, *u; float mn, mx; BOOL lg; int d; } rv[] = {
+        {RV_DRY, "الصوت الأصلي", "Dry Level", "%", 0, 100, NO, 0}, {RV_ELVL, "الانعكاسات المبكرة", "Early Level", "%", 0, 100, NO, 0},
+        {RV_ESEND, "إرسال المبكر للذيل", "Early Send", "%", 0, 100, NO, 0}, {RV_LLVL, "الذيل", "Late Level", "%", 0, 100, NO, 0},
+        {RV_SIZE, "حجم الغرفة", "Size", "m", 8, 60, NO, 0}, {RV_PRE, "التأخير الأولي", "Predelay", "ms", 0, 300, NO, 0},
+        {RV_DECAY, "مدة الصدى", "Decay", "s", 0.1f, 20, NO, 1}, {RV_DIFF, "الانتشار", "Diffuse", "%", 0, 100, NO, 0},
+        {RV_SPIN, "سرعة التذبذب", "Spin", "Hz", 0, 5, NO, 2}, {RV_WANDER, "التجوال", "Wander", "%", 0, 100, NO, 0},
+        {RV_HC, "قطع الأعلى", "High Cut", "Hz", 2000, 20000, YES, 0}, {RV_EDAMP, "كتم المبكر", "Early Damp", "Hz", 2000, 20000, YES, 0},
+        {RV_LDAMP, "كتم الذيل", "Late Damp", "Hz", 2000, 20000, YES, 0}, {RV_LC, "قطع الأدنى", "Low Cut", "Hz", 20, 1000, YES, 0},
+        {RV_LB, "تعزيز الباص", "Low Boost", "%", 0, 200, NO, 0}, {RV_BF, "تردد التعزيز", "Boost Freq", "Hz", 100, 2000, YES, 0}};
+    for (size_t q = 0; q < sizeof rv / sizeof rv[0]; q++) {
+        int ix = rv[q].i;
+        [self.stack addArrangedSubview:RYSliderV(T([NSString stringWithUTF8String:rv[q].ar], [NSString stringWithUTF8String:rv[q].en]), [NSString stringWithUTF8String:rv[q].u], rv[q].mn, rv[q].mx, gRv[ix], rv[q].lg, rv[q].d, ^(float v) { gRv[ix] = v; RYRevSave(); })];
+    }
+    // ---- remove Rave's isolation
+    UISwitch *i1 = [UISwitch new]; i1.on = gIsoSess != 0; i1.onTintColor = RYAccent(); __weak UISwitch *wi1 = i1;
+    [i1 addAction:[UIAction actionWithHandler:^(UIAction *a) { gIsoSess = wi1.on; RYIsoSave(); if (gIsoSess) RYIsoApplySession(); }] forControlEvents:UIControlEventValueChanged];
+    UISwitch *i2 = [UISwitch new]; i2.on = gIsoVP != 0; i2.onTintColor = RYAccent(); __weak UISwitch *wi2 = i2;
+    [i2 addAction:[UIAction actionWithHandler:^(UIAction *a) { gIsoVP = wi2.on; RYIsoSave(); }] forControlEvents:UIControlEventValueChanged];
+    UISwitch *i3 = [UISwitch new]; i3.on = gIsoRTC != 0; i3.onTintColor = RYAccent(); __weak UISwitch *wi3 = i3;
+    [i3 addAction:[UIAction actionWithHandler:^(UIAction *a) { gIsoRTC = wi3.on; RYIsoSave(); }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إزالة عوازل ريف", @"Remove Rave isolation"), 15, UIFontWeightBold, nil),
+        RYHStack(@[RYLabel(T(@"كل العوازل", @"All"), 14, UIFontWeightMedium, nil), RYBtn(T(@"شغّل الكل", @"All on"), YES, ^{ gIsoSess = gIsoVP = gIsoRTC = 1; RYIsoSave(); RYIsoApplySession(); [ws rebuild]; }), RYBtn(T(@"طفّ الكل", @"All off"), NO, ^{ gIsoSess = gIsoVP = gIsoRTC = 0; RYIsoSave(); [ws rebuild]; })], 8),
+        RYHStack(@[RYLabel(T(@"وضع الجلسة (بدون صدى/ضجيج النظام)", @"Session mode (no system voice processing)"), 13, UIFontWeightRegular, nil), i1], 12),
+        RYHStack(@[RYLabel(T(@"معالج الصوت VPIO (صدى، ضجيج، AGC)", @"VPIO audio unit (echo, noise, AGC)"), 13, UIFontWeightRegular, nil), i2], 12),
+        RYHStack(@[RYLabel(T(@"معالجة WebRTC (ضجيج، صدى، AGC)", @"WebRTC processing (noise, echo, AGC)"), 13, UIFontWeightRegular, nil), i3], 12),
+        RYLabel(T(@"بعد التفعيل اطلع من صوت الغرفة وادخل من جديد عشان يتطبق. بدون معالجة النظام لازم تستخدم سماعة وإلا يرجع لك صوتك صدى.", @"After switching, leave voice and join again so it takes effect. Without system processing use headphones or your own voice echoes back."), 12, UIFontWeightRegular, RY_MUTED)])];
+    self.invLabel = RYLabel(RYMicStatus2(), 13, UIFontWeightMedium, RY_MUTED);
     [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYBtn(T(@"نسخ تشخيص المايك", @"Copy mic diagnostics"), NO, ^{ UIPasteboard.generalPasteboard.string = RYMicReport(); [ws toast:T(@"اننسخ", @"Copied")]; })])];
     [self.invUI invalidate];
-    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = RYMicStatus(); }];
+    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = RYMicStatus2(); }];
 }
 #pragma mark Settings
 - (void)renderSettings {
