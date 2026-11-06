@@ -1524,14 +1524,18 @@ static void RYMicLoad(void) {
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicPreset = [CF(@"micPreset", @0) intValue]; gMicSemi = [CF(@"micSemi", @0) floatValue];
     gMicMode = [CF(@"micMode", @0) intValue]; gMicEcho = [CF(@"micEcho", @0) floatValue]; gMicGain = [CF(@"micGain", @1) floatValue];
     gMicDist = [CF(@"micDist", @NO) boolValue]; gMicRev = [CF(@"micRev", @NO) boolValue];
-    { NSArray *rc = CF(@"revCfg", nil); if ([rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue]; }
+    { NSArray *rc = CF(@"revCfg", nil); // the saved echo settings only count if they were saved with the current defaults (version 2); otherwise start from the Dragonfly values
+      if ([CF(@"revCfgVer", @0) intValue] == 2 && [rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue];
+      else { NSMutableArray *d = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) { gRv[i] = kRvDef[i]; [d addObject:@(kRvDef[i])]; } CS(@"revCfg", d); CS(@"revCfgVer", @2); } }
     gDistGain = powf(10.f, [CF(@"distDb", @60) floatValue] / 20.f); gDistOut = powf(10.f, [CF(@"distOutDb", @-3) floatValue] / 20.f); gDistGate = powf(10.f, [CF(@"distGateDb", @-55) floatValue] / 20.f);
     gIsoSess = [CF(@"isoSess", @NO) boolValue]; gIsoVP = [CF(@"isoVP", @NO) boolValue]; gIsoRTC = [CF(@"isoRTC", @NO) boolValue];
 }
 static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
 static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
 static void RYMicSetRev(BOOL on) { gMicRev = on; CS(@"micRev", @(on)); }
-static void RYRevSave(void) { NSMutableArray *a = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) [a addObject:@(gRv[i])]; CS(@"revCfg", a); }
+static void RYRevSave(void) { NSMutableArray *a = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) [a addObject:@(gRv[i])]; CS(@"revCfg", a); CS(@"revCfgVer", @2); }
+static BOOL RYRevIsDefault(void) { for (int i = 0; i < RV_N; i++) if (fabsf(gRv[i] - kRvDef[i]) > 0.0005f) return NO; return YES; }
+static NSString *RYRevStateText(void) { return RYRevIsDefault() ? T(@"القيم = الافتراضية (نفس Dragonfly بالصورة) ✓", @"Values = defaults (same as the Dragonfly screenshot) ✓") : T(@"القيم معدّلة. اضغط \"رجّع الافتراضي\" لو تبي ترجع للأصل.", @"Values changed. Press \"Reset to default\" to go back."); }
 static void RYIsoSave(void) { CS(@"isoSess", @(gIsoSess != 0)); CS(@"isoVP", @(gIsoVP != 0)); CS(@"isoRTC", @(gIsoRTC != 0)); }
 static void RYMicApplyPreset(int i) {
     if (i < 0 || i >= RY_NPRESETS) return; const RYPreset *p = &kPresets[i];
@@ -2256,9 +2260,11 @@ static void RYMsgLoopSet(BOOL on) {
     [self.stack addArrangedSubview:RYSliderV(T(@"مستوى الخروج", @"Output"), @"dB", -30, 0, [CF(@"distOutDb", @-3) floatValue], NO, 0, ^(float v) { gDistOut = powf(10.f, v / 20.f); CS(@"distOutDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"عتبة الكتم", @"Gate"), @"dB", -80, -30, [CF(@"distGateDb", @-55) floatValue], NO, 0, ^(float v) { gDistGate = powf(10.f, v / 20.f); CS(@"distGateDb", @(v)); })];
     // ---- room reverb settings (every control of Dragonfly Room Reverb that matters for a mono voice)
+    UILabel *rvState = RYLabel(RYRevStateText(), 12, UIFontWeightMedium, RY_MUTED); __weak UILabel *wst = rvState;
+    void (^rvReset)(void) = ^{ for (int i = 0; i < RV_N; i++) gRv[i] = kRvDef[i]; RYRevSave(); [ws rebuild]; [ws toast:T(@"رجعت القيم الافتراضية", @"Defaults restored")]; };
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إعدادات الصدى (Dragonfly)", @"Echo settings (Dragonfly)"), 15, UIFontWeightBold, nil),
-        RYLabel(T(@"نفس خانات Dragonfly Room Reverb. القيم الأولية هي اللي بالصورة. (العرض Width ما فيه لأن الصوت أحادي.)", @"Same controls as Dragonfly Room Reverb; the starting values are the ones from your screenshot. (Width is left out: a voice is mono.)"), 12, UIFontWeightRegular, RY_MUTED),
-        RYBtn(T(@"رجّع القيم الأولية", @"Reset to the screenshot values"), NO, ^{ for (int i = 0; i < RV_N; i++) gRv[i] = kRvDef[i]; RYRevSave(); [ws rebuild]; })])];
+        RYLabel(T(@"الافتراضي دايماً هو قيم Dragonfly Room Reverb اللي بالصورة: الصوت الأصلي 46%، المبكر 69%، الإرسال 69%، الذيل 69%، الحجم 32، التأخير 100ms، المدة 10s، الانتشار 0، التذبذب 0، التجوال 40%، القطع 16000/16000/9400، الأدنى 137Hz، التعزيز 100% عند 600Hz. (العرض Width ما فيه لأن الصوت أحادي.)", @"The default is always the Dragonfly Room Reverb values from the screenshot. (Width is left out: a voice is mono.)"), 12, UIFontWeightRegular, RY_MUTED),
+        rvState, RYBtn(T(@"رجّع الافتراضي", @"Reset to default"), YES, rvReset)])];
     struct { int i; const char *ar, *en, *u; float mn, mx; BOOL lg; int d; } rv[] = {
         {RV_DRY, "الصوت الأصلي", "Dry Level", "%", 0, 100, NO, 0}, {RV_ELVL, "الانعكاسات المبكرة", "Early Level", "%", 0, 100, NO, 0},
         {RV_ESEND, "إرسال المبكر للذيل", "Early Send", "%", 0, 100, NO, 0}, {RV_LLVL, "الذيل", "Late Level", "%", 0, 100, NO, 0},
@@ -2270,8 +2276,9 @@ static void RYMsgLoopSet(BOOL on) {
         {RV_LB, "تعزيز الباص", "Low Boost", "%", 0, 200, NO, 0}, {RV_BF, "تردد التعزيز", "Boost Freq", "Hz", 100, 2000, YES, 0}};
     for (size_t q = 0; q < sizeof rv / sizeof rv[0]; q++) {
         int ix = rv[q].i;
-        [self.stack addArrangedSubview:RYSliderV(T([NSString stringWithUTF8String:rv[q].ar], [NSString stringWithUTF8String:rv[q].en]), [NSString stringWithUTF8String:rv[q].u], rv[q].mn, rv[q].mx, gRv[ix], rv[q].lg, rv[q].d, ^(float v) { gRv[ix] = v; RYRevSave(); })];
+        [self.stack addArrangedSubview:RYSliderV(T([NSString stringWithUTF8String:rv[q].ar], [NSString stringWithUTF8String:rv[q].en]), [NSString stringWithUTF8String:rv[q].u], rv[q].mn, rv[q].mx, gRv[ix], rv[q].lg, rv[q].d, ^(float v) { gRv[ix] = v; RYRevSave(); wst.text = RYRevStateText(); })];
     }
+    [self.stack addArrangedSubview:RYCard(@[RYBtn(T(@"رجّع الافتراضي (الصدى)", @"Reset echo to default"), NO, rvReset)])];
     // ---- remove Rave's isolation
     UISwitch *i1 = [UISwitch new]; i1.on = gIsoSess != 0; i1.onTintColor = RYAccent(); __weak UISwitch *wi1 = i1;
     [i1 addAction:[UIAction actionWithHandler:^(UIAction *a) { gIsoSess = wi1.on; RYIsoSave(); if (gIsoSess) RYIsoApplySession(); }] forControlEvents:UIControlEventValueChanged];
