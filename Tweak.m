@@ -1136,6 +1136,7 @@ static volatile float gMicSemi = 0, gMicEcho = 0, gMicGain = 1;
 static volatile long long gMicCallsA = 0, gMicCallsU = 0, gMicCallsT = 0, gMicProc = 0;
 static volatile int gMicRebound = 0, gMicWrapped = 0, gMicTapInst = 0;
 static volatile int gMicDist = 0, gMicRev = 0, gMonOn = 0;
+#define RY_FX_ON (gMicOn || gMicDist || gMicRev)   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch
 enum { RV_DRY, RV_ELVL, RV_ESEND, RV_LLVL, RV_SIZE, RV_PRE, RV_DECAY, RV_DIFF, RV_SPIN, RV_WANDER, RV_HC, RV_EDAMP, RV_LDAMP, RV_LC, RV_LB, RV_BF, RV_N };
 static const float kRvDef[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600}; // the Dragonfly Room Reverb values from the screenshot
 static volatile float gRv[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600};
@@ -1212,7 +1213,8 @@ static inline float RYRev(float x, RYVS *s, const RYRevC *c) {
 static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
     if (s->sr != sr) { memset(s, 0, sizeof(RYVS)); s->sr = sr; s->d1 = (float)(0.016 * sr); }
     const int W = (int)(0.032 * sr); const int revOn = gMicRev; RYRevC rc; if (revOn) RYRevPrep(&rc, sr);
-    const float semi = gMicSemi, echo = gMicEcho, gain = gMicGain; const int mode = gMicMode;
+    const int mst = gMicOn; // pitch / voice / echo / mic level belong to the main switch; amplifier and silver echo have their own
+    const float semi = mst ? gMicSemi : 0.f, echo = mst ? gMicEcho : 0.f, gain = mst ? gMicGain : 1.f; const int mode = mst ? gMicMode : 0;
     const float dd = 1.f - powf(2.f, semi / 12.f);
     const BOOL pitch = fabsf(semi) > 0.05f;
     int ed = (int)(0.27 * sr); if (ed >= RYM_ECHO) ed = RYM_ECHO - 1;
@@ -1277,7 +1279,7 @@ static void RYMonStart(void) {
         });
     });
 }
-static inline void RYMicFx(float *t, int c, double sr, RYVS *s) { if (gMicOn) RYVoiceBlock(t, c, sr, s); if (gMonOn) RYMonFeed(t, c, sr); }
+static inline void RYMicFx(float *t, int c, double sr, RYVS *s) { if (RY_FX_ON) RYVoiceBlock(t, c, sr, s); if (gMonOn) RYMonFeed(t, c, sr); }
 // interleaved: channel 0 is processed and copied to the other channels
 static void RYProcInter(void *data, BOOL isFloat, UInt32 frames, UInt32 ch, double sr, RYVS *s) {
     if (!data || !ch) return; float tmp[2048]; UInt32 done = 0;
@@ -1336,7 +1338,7 @@ static OSStatus RYAURender(AudioUnit u, AudioUnitRenderActionFlags *fl, const Au
     OSStatus r = orig_aurender ? orig_aurender(u, fl, ts, bus, n, io) : -50;
     if (r != noErr || bus != 1 || !io) return r;
     gMicCallsA++;
-    if (!gMicOn && !gMonOn) return r;
+    if (!RY_FX_ON && !gMonOn) return r;
     static AudioUnit lastU; static AudioStreamBasicDescription f; static BOOL ok;
     if (u != lastU) {
         lastU = u; UInt32 sz = sizeof f; memset(&f, 0, sizeof f);
@@ -1399,7 +1401,7 @@ static AURenderBlock RYRBGetter(id self, SEL _cmd) {
         if (r != noErr || bus != 1 || !io) return r;
         long long calls = ++gMicCallsU;
         if (calls <= 3 || calls % 2000 == 0) snprintf(gMicLast, sizeof gMicLast, "frames=%u buffers=%u b0: ch=%u bytes=%u data=%d have=%d inferred=%d", (unsigned)n, (unsigned)io->mNumberBuffers, io->mNumberBuffers ? (unsigned)io->mBuffers[0].mNumberChannels : 0, io->mNumberBuffers ? (unsigned)io->mBuffers[0].mDataByteSize : 0, io->mNumberBuffers ? io->mBuffers[0].mData != NULL : 0, cx->have, cx->inferred);
-        if (!gMicOn && !gMonOn) return r;
+        if (!RY_FX_ON && !gMonOn) return r;
         AudioStreamBasicDescription f;
         if (cx->have) f = cx->f;
         else {
@@ -1455,7 +1457,7 @@ static void RYTapInstall(id self, SEL _cmd, AVAudioNodeBus bus, AVAudioFrameCoun
     RYTapBlock w = blk;
     if (blk && [self isKindOfClass:[AVAudioInputNode class]]) {
         gMicTapInst++;
-        w = [^(AVAudioPCMBuffer *b, AVAudioTime *t) { gMicCallsT++; if (gMicOn || gMonOn) RYTapProcess(b); blk(b, t); } copy];
+        w = [^(AVAudioPCMBuffer *b, AVAudioTime *t) { gMicCallsT++; if (RY_FX_ON || gMonOn) RYTapProcess(b); blk(b, t); } copy];
     }
     orig_tap(self, _cmd, bus, size, fmt, w);
 }
@@ -1540,7 +1542,7 @@ static NSString *RYMicStatus(void) {
     long long calls = gMicCallsA + gMicCallsU + gMicCallsT;
     if (!calls) return T(@"لسا ما التقطت المايك. ادخل صوت الغرفة وافتح المايك، وبعدها تظهر الحالة هنا.", @"No microphone data seen yet. Join voice in a room and unmute; the status shows up here.");
     NSString *route = gMicCallsA ? @"A" : gMicCallsU ? @"U" : @"T";
-    if (!gMicOn) return [NSString stringWithFormat:T(@"المايك مرصود ✓ (مسار %@)، المغيّر مطفي.", @"Microphone detected ✓ (route %@), changer is off."), route];
+    if (!RY_FX_ON) return [NSString stringWithFormat:T(@"المايك مرصود ✓ (مسار %@)، المغيّر مطفي.", @"Microphone detected ✓ (route %@), changer is off."), route];
     return [NSString stringWithFormat:T(@"يشتغل ✓ (مسار %@، إطارات معالجة: %lld)", @"Working ✓ (route %@, frames processed: %lld)"), route, (long long)gMicProc];
 }
 static NSString *RYMicStatus2(void) {
@@ -2241,8 +2243,8 @@ static void RYMsgLoopSet(BOOL on) {
     [s2 addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetRev(ws2.on); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"فضي", @"Silver"), 15, UIFontWeightBold, nil),
         RYHStack(@[RYLabel(T(@"مضخم", @"Amplifier"), 14, UIFontWeightMedium, nil), s1], 12),
-        RYHStack(@[RYLabel(T(@"صدى مضخم", @"Big echo"), 14, UIFontWeightMedium, nil), s2], 12),
-        RYLabel(T(@"مضخم: تضخيم وتشويه قوي (نفس Plus Distortion على الأخير). صدى مضخم: صدى غرفة كبيرة وطويلة (نفس Dragonfly Room Reverb على الأخير). يشتغلون فوق الصوت المختار، وتقدر تفعّل الاثنين مع بعض.", @"Amplifier: heavy gain and distortion (Plus Distortion at maximum). Big echo: large, long room reverb (Dragonfly Room Reverb at maximum). They sit on top of the chosen voice and can be combined."), 12, UIFontWeightRegular, RY_MUTED)])];
+        RYHStack(@[RYLabel(T(@"صدى فضي", @"Silver echo"), 14, UIFontWeightMedium, nil), s2], 12),
+        RYLabel(T(@"مضخم: تضخيم وتشويه قوي (نفس Plus Distortion على الأخير). صدى فضي: صدى غرفة كبيرة وطويلة (نفس Dragonfly Room Reverb على الأخير). يشتغلون حتى لو مغيّر الصوت مطفي، وفوق الصوت المختار لو شغّال، وتقدر تفعّل الاثنين مع بعض.", @"Amplifier: heavy gain and distortion (Plus Distortion at maximum). Silver echo: large, long room reverb (Dragonfly Room Reverb at maximum). They work even when the voice changer is off, sit on top of the chosen voice when it is on, and can be combined."), 12, UIFontWeightRegular, RY_MUTED)])];
     UISwitch *s3 = [UISwitch new]; s3.on = gMonOn != 0; s3.onTintColor = RYAccent(); __weak UISwitch *ws3 = s3;
     [s3 addAction:[UIAction actionWithHandler:^(UIAction *a) { if (ws3.on) RYMonStart(); else RYMonStop(); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"اسمع صوتي", @"Hear my voice"), 15, UIFontWeightBold, nil), s3], 12),
