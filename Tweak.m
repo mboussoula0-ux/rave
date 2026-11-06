@@ -1124,7 +1124,7 @@ static volatile int gMicOn = 0, gMicMode = 0, gMicPreset = 0;
 static volatile float gMicSemi = 0, gMicEcho = 0, gMicGain = 1;
 static volatile long long gMicCallsA = 0, gMicCallsU = 0, gMicCallsT = 0, gMicProc = 0;
 static volatile int gMicRebound = 0, gMicWrapped = 0, gMicTapInst = 0;
-static char gMicFmt[96] = "-";
+static char gMicFmt[96] = "-"; static char gMicLast[200] = "-"; static volatile long long gMicSkip = 0; static volatile double gMicHWRate = 48000;
 
 #define RYM_BUF 8192      // pitch history (power of two)
 #define RYM_ECHO 32768    // echo line (power of two)
@@ -1198,17 +1198,18 @@ static void RYProcPlanar(void **planes, UInt32 np, BOOL isFloat, UInt32 frames, 
 }
 // route A/U: raw buffers described by an AudioStreamBasicDescription
 static void RYMicProcessASBD(const AudioStreamBasicDescription *f, UInt32 n, AudioBufferList *io, RYVS *s) {
-    if (!f || !io || f->mFormatID != kAudioFormatLinearPCM || !io->mNumberBuffers) return;
+    if (!f || !io || f->mFormatID != kAudioFormatLinearPCM || !io->mNumberBuffers) { gMicSkip++; return; }
     BOOL isFloat = (f->mFormatFlags & kAudioFormatFlagIsFloat) != 0, planar = (f->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
     UInt32 bits = f->mBitsPerChannel, ch = f->mChannelsPerFrame ? f->mChannelsPerFrame : 1;
-    if (!((isFloat && bits == 32) || (!isFloat && bits == 16))) return;
+    if (!((isFloat && bits == 32) || (!isFloat && bits == 16))) { gMicSkip++; return; }
+    double sr = f->mSampleRate > 0 ? f->mSampleRate : (gMicHWRate > 0 ? gMicHWRate : 48000);
     if (!planar) {
         AudioBuffer *b = &io->mBuffers[0]; UInt32 frames = b->mDataByteSize / (ch * (bits / 8)); if (frames > n) frames = n;
-        RYProcInter(b->mData, isFloat, frames, ch, f->mSampleRate, s);
+        RYProcInter(b->mData, isFloat, frames, ch, sr, s);
     } else {
         void *pl[8]; UInt32 np = io->mNumberBuffers > 8 ? 8 : io->mNumberBuffers; UInt32 frames = n;
         for (UInt32 q = 0; q < np; q++) { pl[q] = io->mBuffers[q].mData; UInt32 fq = io->mBuffers[q].mDataByteSize / (bits / 8); if (fq < frames) frames = fq; }
-        RYProcPlanar(pl, np, isFloat, frames, f->mSampleRate, s);
+        RYProcPlanar(pl, np, isFloat, frames, sr, s);
     }
 }
 // ---- route A: the C function AudioUnitRender (the stock WebRTC capture path calls it on input bus 1)
@@ -1229,18 +1230,63 @@ static OSStatus RYAURender(AudioUnit u, AudioUnitRenderActionFlags *fl, const Au
 }
 // ---- route U: AUAudioUnit.renderBlock (apps that drive an AUAudioUnit themselves, e.g. a custom RTCAudioDevice)
 static NSMutableDictionary<NSString *, NSValue *> *gRBOrig;
+// The format of the captured bus is NOT valid yet when the app asks for the block (it read 0Hz 0ch), so it is read later, off the render thread,
+// and until it is known nothing is touched. If the unit never reports one, it is inferred from the buffer layout as a last resort.
+typedef struct { AudioStreamBasicDescription f; volatile int have; volatile int tries; volatile int inferred; } RYUCtx;
+static BOOL RYFmtFromAU(AUAudioUnit *au, AudioStreamBasicDescription *out) {
+    @try {
+        AUAudioUnitBusArray *ob = au.outputBusses;
+        if (ob.count > 1) {
+            const AudioStreamBasicDescription *p = ob[1].format.streamDescription;
+            if (p && p->mFormatID == kAudioFormatLinearPCM && p->mSampleRate > 0 && p->mChannelsPerFrame && p->mBitsPerChannel) { *out = *p; return YES; }
+        }
+    } @catch (__unused id e) {}
+    return NO;
+}
+static BOOL RYFmtInfer(const AudioBufferList *io, UInt32 n, AudioStreamBasicDescription *o) {
+    if (!n || !io->mNumberBuffers) return NO;
+    const AudioBuffer *b0 = &io->mBuffers[0]; if (!b0->mData || b0->mDataByteSize < n || (b0->mDataByteSize % n)) return NO;
+    memset(o, 0, sizeof *o); o->mFormatID = kAudioFormatLinearPCM; o->mSampleRate = gMicHWRate > 0 ? gMicHWRate : 48000;
+    UInt32 nb = io->mNumberBuffers, per = b0->mDataByteSize / n, ch, sample;
+    if (nb == 1) { ch = b0->mNumberChannels ? b0->mNumberChannels : 1; sample = per / ch; }
+    else { ch = nb; sample = per; o->mFormatFlags |= kAudioFormatFlagIsNonInterleaved; }
+    if (sample == 4) o->mFormatFlags |= kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    else if (sample == 2) o->mFormatFlags |= kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    else return NO;
+    o->mChannelsPerFrame = ch; o->mBitsPerChannel = sample * 8; o->mFramesPerPacket = 1;
+    o->mBytesPerFrame = (nb == 1) ? sample * ch : sample; o->mBytesPerPacket = o->mBytesPerFrame;
+    return YES;
+}
+static void RYFmtText(const char *tag, const AudioStreamBasicDescription *f) {
+    snprintf(gMicFmt, sizeof gMicFmt, "%s: %.0fHz %uch %ubit %s%s", tag, f->mSampleRate, (unsigned)f->mChannelsPerFrame, (unsigned)f->mBitsPerChannel, (f->mFormatFlags & kAudioFormatFlagIsFloat) ? "float" : "int", (f->mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? " planar" : "");
+}
 static AURenderBlock RYRBGetter(id self, SEL _cmd) {
     IMP o = NULL; for (Class k = object_getClass(self); k && !o; k = class_getSuperclass(k)) { NSValue *v = gRBOrig[NSStringFromClass(k)]; if (v) o = (IMP)[v pointerValue]; }
     AURenderBlock orig = o ? ((AURenderBlock (*)(id, SEL))o)(self, _cmd) : nil;
     if (!orig) return orig;
-    AudioStreamBasicDescription fmt; BOOL has = NO; memset(&fmt, 0, sizeof fmt);
-    @try { AUAudioUnit *au = (AUAudioUnit *)self; if ((au.isInputEnabled || [NSStringFromClass(object_getClass(au)) containsString:@"IO"]) && au.outputBusses.count > 1) { /* only units that really capture input */ const AudioStreamBasicDescription *p = au.outputBusses[1].format.streamDescription; if (p) { fmt = *p; has = YES; } } } @catch (__unused id e) {}
-    if (!has) return orig;
+    BOOL cap = NO; @try { AUAudioUnit *au = (AUAudioUnit *)self; cap = (au.isInputEnabled || [NSStringFromClass(object_getClass(au)) containsString:@"IO"]) && au.outputBusses.count > 1; } @catch (__unused id e) {}
+    if (!cap) return orig; // only units that really capture input
     gMicWrapped++;
-    snprintf(gMicFmt, sizeof gMicFmt, "U: %.0fHz %uch %ubit %s%s", fmt.mSampleRate, (unsigned)fmt.mChannelsPerFrame, (unsigned)fmt.mBitsPerChannel, (fmt.mFormatFlags & kAudioFormatFlagIsFloat) ? "float" : "int", (fmt.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? " planar" : "");
+    RYUCtx *cx = (RYUCtx *)calloc(1, sizeof(RYUCtx)); __weak AUAudioUnit *wau = (AUAudioUnit *)self;
     return [^AUAudioUnitStatus(AudioUnitRenderActionFlags *fl, const AudioTimeStamp *ts, AUAudioFrameCount n, NSInteger bus, AudioBufferList *io, AURenderPullInputBlock pull) {
         AUAudioUnitStatus r = orig(fl, ts, n, bus, io, pull);
-        if (r == noErr && bus == 1 && io) { gMicCallsU++; if (gMicOn) RYMicProcessASBD(&fmt, n, io, &gVS[1]); }
+        if (r != noErr || bus != 1 || !io) return r;
+        long long calls = ++gMicCallsU;
+        if (calls <= 3 || calls % 2000 == 0) snprintf(gMicLast, sizeof gMicLast, "frames=%u buffers=%u b0: ch=%u bytes=%u data=%d have=%d inferred=%d", (unsigned)n, (unsigned)io->mNumberBuffers, io->mNumberBuffers ? (unsigned)io->mBuffers[0].mNumberChannels : 0, io->mNumberBuffers ? (unsigned)io->mBuffers[0].mDataByteSize : 0, io->mNumberBuffers ? io->mBuffers[0].mData != NULL : 0, cx->have, cx->inferred);
+        if (!gMicOn) return r;
+        if (!cx->have) {
+            int t = cx->tries++;
+            if (t % 100 == 0) { // ask the unit for its real format, away from the audio thread
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    AUAudioUnit *au = wau; AudioStreamBasicDescription g;
+                    if (au && RYFmtFromAU(au, &g)) { cx->f = g; cx->inferred = 0; cx->have = 1; RYFmtText("U", &g); }
+                });
+            }
+            if (!cx->have && t >= 500) { AudioStreamBasicDescription g; if (RYFmtInfer(io, n, &g)) { cx->f = g; cx->inferred = 1; cx->have = 1; RYFmtText("U(inferred)", &g); } }
+            if (!cx->have) { gMicSkip++; return r; }
+        }
+        AudioStreamBasicDescription f = cx->f;
+        RYMicProcessASBD(&f, n, io, &gVS[1]);
         return r;
     } copy];
 }
@@ -1294,6 +1340,7 @@ static void RYInstallTapHook(void) {
 }
 // ---- settings
 static void RYMicLoad(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{ double r = AVAudioSession.sharedInstance.sampleRate; if (r > 0) gMicHWRate = r; });
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicPreset = [CF(@"micPreset", @0) intValue]; gMicSemi = [CF(@"micSemi", @0) floatValue];
     gMicMode = [CF(@"micMode", @0) intValue]; gMicEcho = [CF(@"micEcho", @0) floatValue]; gMicGain = [CF(@"micGain", @1) floatValue];
 }
@@ -1311,8 +1358,8 @@ static NSString *RYMicStatus(void) {
     return [NSString stringWithFormat:T(@"يشتغل ✓ (مسار %@، إطارات معالجة: %lld)", @"Working ✓ (route %@, frames processed: %lld)"), route, (long long)gMicProc];
 }
 static NSString *RYMicReport(void) {
-    return [NSString stringWithFormat:@"mic voice changer\non=%d preset=%d semi=%.1f mode=%d echo=%.2f gain=%.2f\nroute A (AudioUnitRender bus 1): calls=%lld, images rebound=%d\nroute U (AUAudioUnit renderBlock): calls=%lld, blocks wrapped=%d\nroute T (AVAudioEngine input tap): calls=%lld, taps installed=%d\nframes processed=%lld\nformat=%s\n",
-        gMicOn, gMicPreset, gMicSemi, gMicMode, gMicEcho, gMicGain, gMicCallsA, gMicRebound, gMicCallsU, gMicWrapped, gMicCallsT, gMicTapInst, (long long)gMicProc, gMicFmt];
+    return [NSString stringWithFormat:@"mic voice changer\non=%d preset=%d semi=%.1f mode=%d echo=%.2f gain=%.2f\nroute A (AudioUnitRender bus 1): calls=%lld, images rebound=%d\nroute U (AUAudioUnit renderBlock): calls=%lld, blocks wrapped=%d\nroute T (AVAudioEngine input tap): calls=%lld, taps installed=%d\nframes processed=%lld (skipped calls=%lld)\nformat=%s\nlast buffer: %s\nhw sample rate=%.0f\n",
+        gMicOn, gMicPreset, gMicSemi, gMicMode, gMicEcho, gMicGain, gMicCallsA, gMicRebound, gMicCallsU, gMicWrapped, gMicCallsT, gMicTapInst, (long long)gMicProc, (long long)gMicSkip, gMicFmt, gMicLast, gMicHWRate];
 }
 
 // minimal symbol-pointer rebinding (same idea as fishhook)
