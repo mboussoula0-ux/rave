@@ -1145,7 +1145,8 @@ static volatile float gMicSemi = 0, gMicEcho = 0, gMicGain = 1;
 static volatile long long gMicCallsA = 0, gMicCallsU = 0, gMicCallsT = 0, gMicProc = 0;
 static volatile int gMicRebound = 0, gMicWrapped = 0, gMicTapInst = 0;
 static volatile int gMicDist = 0, gMicRev = 0, gMonOn = 0;
-#define RY_FX_ON (gMicOn || gMicDist || gMicRev)   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch
+static volatile int gMicMute = 0; // "سكر صوتي": hard-silences the mic no matter what else is on
+#define RY_FX_ON (gMicOn || gMicDist || gMicRev || gMicMute)   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch
 enum { RV_DRY, RV_ELVL, RV_ESEND, RV_LLVL, RV_SIZE, RV_PRE, RV_DECAY, RV_DIFF, RV_SPIN, RV_WANDER, RV_HC, RV_EDAMP, RV_LDAMP, RV_LC, RV_LB, RV_BF, RV_N };
 static const float kRvDef[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600}; // the Dragonfly Room Reverb values from the screenshot
 static volatile float gRv[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600};
@@ -1221,6 +1222,7 @@ static inline float RYRev(float x, RYVS *s, const RYRevC *c) {
 // pitch shift = two read taps on a delay line that slides at (1 - ratio) samples per sample, cross-faded with a Hann window
 static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
     if (s->sr != sr) { memset(s, 0, sizeof(RYVS)); s->sr = sr; s->d1 = (float)(0.016 * sr); }
+    if (gMicMute) { memset(x, 0, (size_t)n * sizeof(float)); return; } // overrides everything else, on purpose
     const int W = (int)(0.032 * sr); const int revOn = gMicRev; RYRevC rc; if (revOn) RYRevPrep(&rc, sr);
     const int mst = gMicOn; // pitch / voice / echo / mic level belong to the main switch; amplifier and silver echo have their own
     const float semi = mst ? gMicSemi : 0.f, echo = mst ? gMicEcho : 0.f, gain = mst ? gMicGain : 1.f; const int mode = mst ? gMicMode : 0;
@@ -1532,7 +1534,7 @@ static void RYMicLoad(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ double r = AVAudioSession.sharedInstance.sampleRate; if (r > 0) gMicHWRate = r; });
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicPreset = [CF(@"micPreset", @0) intValue]; gMicSemi = [CF(@"micSemi", @0) floatValue];
     gMicMode = [CF(@"micMode", @0) intValue]; gMicEcho = [CF(@"micEcho", @0) floatValue]; gMicGain = [CF(@"micGain", @1) floatValue];
-    gMicDist = [CF(@"micDist", @NO) boolValue]; gMicRev = [CF(@"micRev", @NO) boolValue];
+    gMicDist = [CF(@"micDist", @NO) boolValue]; gMicRev = [CF(@"micRev", @NO) boolValue]; gMicMute = 0; // never restore "on": always starts unmuted so it's never silently stuck
     { NSArray *rc = CF(@"revCfg", nil); // the saved echo settings only count if they were saved with the current defaults (version 2); otherwise start from the Dragonfly values
       if ([CF(@"revCfgVer", @0) intValue] == 2 && [rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue];
       else { NSMutableArray *d = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) { gRv[i] = kRvDef[i]; [d addObject:@(kRvDef[i])]; } CS(@"revCfg", d); CS(@"revCfgVer", @2); } }
@@ -1542,6 +1544,7 @@ static void RYMicLoad(void) {
 static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
 static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
 static void RYMicSetRev(BOOL on) { gMicRev = on; CS(@"micRev", @(on)); }
+static void RYMicSetMute(BOOL on) { gMicMute = on; } // not persisted on purpose (see RYInit note)
 static void RYRevSave(void) { NSMutableArray *a = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) [a addObject:@(gRv[i])]; CS(@"revCfg", a); CS(@"revCfgVer", @2); }
 static BOOL RYRevIsDefault(void) { for (int i = 0; i < RV_N; i++) if (fabsf(gRv[i] - kRvDef[i]) > 0.0005f) return NO; return YES; }
 static NSString *RYRevStateText(void) { return RYRevIsDefault() ? T(@"الافتراضي ✓", @"Default ✓") : T(@"معدّل", @"Changed"); }
@@ -1896,9 +1899,10 @@ static NSString *RYReport(void) {
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger code))done;
 // one-shot invite pass over the visible list (Recents / Friends screen)
 @property (nonatomic) BOOL invRunning;
+@property (nonatomic) BOOL invReadyToSend; // selection pass finished; waiting for you to press "send" yourself
 @property (nonatomic) NSInteger invSent;
 @property (nonatomic, copy) NSString *invStatus;
-- (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft;
+- (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft; - (void)invSendNow;
 @end
 
 #pragma mark - Panel
@@ -2101,6 +2105,7 @@ static void RYMsgLoopSet(BOOL on) {
 #pragma mark Invites
 - (NSString *)invText {
     RYCore *c = [RYCore shared];
+    if (c.invReadyToSend) return [NSString stringWithFormat:T(@"انحدد %ld. اضغط \"إرسال الآن\" لما تكون جاهز.", @"%ld selected. Press \"Send now\" when you're ready."), (long)c.invSent];
     if (c.invRunning) return [NSString stringWithFormat:T(@"شغّال… انرسل %ld دعوة\n%@", @"Running… %ld sent\n%@"), (long)c.invSent, c.invStatus ?: @""];
     NSInteger left = [c invCooldownLeft];
     if (left > 0) return [NSString stringWithFormat:T(@"آخر تشغيل: %ld دعوة. تقدر تشغّل بعد %ld:%02ld", @"Last run: %ld sent. Available again in %ld:%02ld"), (long)c.invSent, (long)(left / 60), (long)(left % 60)];
@@ -2121,7 +2126,14 @@ static void RYMsgLoopSet(BOOL on) {
         [ws presentViewController:a animated:YES completion:nil];
     });
     UIButton *stop = RYBtn(T(@"إيقاف", @"Stop"), NO, ^{ [[RYCore shared] stopInvites]; });
-    [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYHStack(@[go, stop], 8)])];
+    UIButton *sendNow = RYBtn(T(@"إرسال الآن", @"Send now"), YES, ^{
+        RYCore *c = [RYCore shared]; if (!c.invReadyToSend) return;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"تأكيد", @"Confirm") message:[NSString stringWithFormat:T(@"إرسال الدعوة لكل الـ %ld اللي اتحددوا؟", @"Send the invite to all %ld selected?"), (long)c.invSent] preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:T(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+        [a addAction:[UIAlertAction actionWithTitle:T(@"إرسال", @"Send") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [c invSendNow]; }]];
+        [ws presentViewController:a animated:YES completion:nil];
+    });
+    [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYHStack(@[go, stop], 8), sendNow])];
     [self startInvUI];
 }
 - (void)startInvUI {
@@ -2232,6 +2244,11 @@ static void RYMsgLoopSet(BOOL on) {
 #pragma mark Mic
 - (void)renderMic {
     __weak typeof(self) ws = self;
+    UISwitch *smute = [UISwitch new]; smute.on = gMicMute != 0; smute.onTintColor = UIColor.systemRedColor; __weak UISwitch *wsmute = smute;
+    [smute addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetMute(wsmute.on); [ws rebuild]; }] forControlEvents:UIControlEventValueChanged];
+    UIView *muteCard = RYCard(@[RYHStack(@[RYLabel(T(@"سكر صوتي", @"Kill mic"), 16, UIFontWeightBold, gMicMute ? UIColor.systemRedColor : nil), smute], 12),
+        RYLabel(T(@"مايطلع أي صوت من مايكك للباقين مهما سويت، لين تطفيه من هنا.", @"Nothing from your mic reaches anyone else, no matter what, until you turn this off here."), 12, UIFontWeightRegular, RY_MUTED)]);
+    [self.stack addArrangedSubview:muteCard];
     UISwitch *sw = [UISwitch new]; sw.on = gMicOn != 0; sw.onTintColor = RYAccent(); __weak UISwitch *wsw = sw;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetOn(wsw.on); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تشغيل مغيّر الصوت", @"Voice changer"), 15, UIFontWeightBold, nil), sw], 12)])];
@@ -2674,11 +2691,14 @@ static void RYRowDump(UIView *cell) {
 - (NSInteger)invCooldownLeft { if (!gInvLast) return 0; NSInteger l = (NSInteger)(240 - ([NSDate date].timeIntervalSince1970 - gInvLast)); return l > 0 ? l : 0; }
 - (void)stopInvites {
     [gInvTimer invalidate]; gInvTimer = nil;
-    if (self.invRunning) { self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow(); self.invStatus = [NSString stringWithFormat:T(@"وقف. حُدّد %ld.", @"Stopped. %ld selected."), (long)self.invSent]; }
+    if (self.invRunning || self.invReadyToSend) {
+        self.invRunning = NO; self.invReadyToSend = NO; if (gInvOK > 0) gInvLast = RYNow();
+        self.invStatus = [NSString stringWithFormat:T(@"وقف. حُدّد %ld.", @"Stopped. %ld selected."), (long)self.invSent];
+    }
 }
 - (void)startInvites {
     if (self.invRunning || [self invCooldownLeft] > 0) return;
-    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
+    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invReadyToSend = NO; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
     gInvPend = NO; gInvSending = NO; gInvFinalSend = NO; gInvDumped = NO; gInvFail = 0; gInvSelected = 0; gInvMethod = -1; gInvPendCell = nil;
     gInvEndT = 0; gInvChkOn = NO; gInvSendUntil = 0;
     gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
@@ -2687,6 +2707,19 @@ static void RYRowDump(UIView *cell) {
     [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow();
     self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
     if (gInvOK == 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما تحدد أحد، انسخت التفاصيل", @" - nothing got selected, details copied")]; }
+}
+// selection pass is done (reached the end of the list, or got stuck/refused repeatedly): stop and wait for you to press send yourself
+- (void)invWaitForSend:(NSString *)why {
+    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow();
+    self.invReadyToSend = YES;
+    self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
+}
+- (void)invSendNow {
+    if (!self.invReadyToSend) return;
+    self.invReadyToSend = NO; self.invStatus = T(@"جاري الإرسال…", @"Sending…"); self.invRunning = YES;
+    [self invPressSend:YES];
+    // invPressSend only sets the "sending" flag; restart the ticker so invStep notices gInvSending finish and calls invFinish
+    gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
 }
 // press "Send N invites"; final = the list is finished
 - (void)invPressSend:(BOOL)final {
@@ -2732,7 +2765,7 @@ static void RYRowDump(UIView *cell) {
         else { gInvFail += 2; [gInvLog appendFormat:@"batch check: counter %ld did not rise (was %ld)\n", (long)c, (long)gInvChkBefore]; }
     }
     if (gInvFail >= 3) { // refused repeatedly: a selection limit (send what we have) or the tap does not reach the circle
-        if (gInvSelected > 0) { [self invPressSend:NO]; return; }
+        if (gInvSelected > 0) { [self invWaitForSend:T(@"وقف التحديد (ما قدر يكمل أكثر). اضغط إرسال للمحدد:", @"Selection stopped (could not go further). Press send for the selected:")]; return; }
         [self invFinish:T(@"ما قدرت أحدد الدايرة. المحدد:", @"Could not tick the circle. Selected:")]; return;
     }
     BOOL anyNew = NO;
@@ -2773,7 +2806,7 @@ static void RYRowDump(UIView *cell) {
     if (sv.contentOffset.y >= maxY - 2) { // at the bottom with nothing new: wait a moment (the app may load more rows), then send
         if (!gInvEndT) gInvEndT = now;
         if (now - gInvEndT > 1.2 && !gInvChkOn) {
-            if (RYSendCountNow() > 0) [self invPressSend:YES]; else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")];
+            if (RYSendCountNow() > 0) [self invWaitForSend:T(@"خلصت القائمة. اضغط إرسال للمحدد:", @"Reached the end. Press send for the selected:")]; else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")];
         }
     } else gInvEndT = 0;
 }
