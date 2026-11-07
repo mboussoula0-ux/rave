@@ -35,7 +35,7 @@
 #pragma mark - Config / storage
 
 #define RY_CFG @"ry.cfg.v1"
-#define RY_ROOM_DEFAULT @"MeshContentViewController"
+#define RY_ROOM_DEFAULT @"MeshContentRootView" // was "MeshContentViewController" (renamed in Rave 9.0/2885); from the "ContentHostReadyController<MeshContentRootView>" entry in the screens diagnostic
 #define RY_CHAT_DEFAULT @"MeshChatBarController"
 #define RY_BRAND_TOKENS @"rave,logo,wordmark,c7d7409e"
 
@@ -1897,12 +1897,11 @@ static NSString *RYReport(void) {
 - (void)hud:(NSString *)s;
 - (void)start; - (void)openPanel; - (void)panelClosed; - (void)bump;
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger code))done;
-// one-shot invite pass over the visible list (Recents / Friends screen)
+// invite pass over the visible list (Recents / Friends screen): one row at a time, 0.4s apart
 @property (nonatomic) BOOL invRunning;
-@property (nonatomic) BOOL invReadyToSend; // selection pass finished; waiting for you to press "send" yourself
 @property (nonatomic) NSInteger invSent;
 @property (nonatomic, copy) NSString *invStatus;
-- (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft; - (void)invSendNow;
+- (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft;
 @end
 
 #pragma mark - Panel
@@ -2105,7 +2104,6 @@ static void RYMsgLoopSet(BOOL on) {
 #pragma mark Invites
 - (NSString *)invText {
     RYCore *c = [RYCore shared];
-    if (c.invReadyToSend) return [NSString stringWithFormat:T(@"انحدد %ld. اضغط \"إرسال الآن\" لما تكون جاهز.", @"%ld selected. Press \"Send now\" when you're ready."), (long)c.invSent];
     if (c.invRunning) return [NSString stringWithFormat:T(@"شغّال… انرسل %ld دعوة\n%@", @"Running… %ld sent\n%@"), (long)c.invSent, c.invStatus ?: @""];
     NSInteger left = [c invCooldownLeft];
     if (left > 0) return [NSString stringWithFormat:T(@"آخر تشغيل: %ld دعوة. تقدر تشغّل بعد %ld:%02ld", @"Last run: %ld sent. Available again in %ld:%02ld"), (long)c.invSent, (long)(left / 60), (long)(left % 60)];
@@ -2120,20 +2118,13 @@ static void RYMsgLoopSet(BOOL on) {
         RYCore *c = [RYCore shared];
         if (c.invRunning) return;
         if ([c invCooldownLeft] > 0) { [ws toast:T(@"انتظر انتهاء المؤقت (4 دقايق)", @"Wait for the 4-minute cooldown")]; return; }
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"تأكيد", @"Confirm") message:T(@"إرسال دعوة لكل شخص ظاهر في القائمة الحالية (مرة وحدة)؟", @"Send one invite to everyone in the current list?") preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"تأكيد", @"Confirm") message:T(@"إرسال دعوة لكل شخص ظاهر في القائمة الحالية، وحده وحده، بفاصل 0.4 ثانية بينهم؟", @"Send an invite to everyone in the current list, one at a time, 0.4s apart?") preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:T(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
         [a addAction:[UIAlertAction actionWithTitle:T(@"ابدأ", @"Start") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [c startInvites]; [ws startInvUI]; }]];
         [ws presentViewController:a animated:YES completion:nil];
     });
     UIButton *stop = RYBtn(T(@"إيقاف", @"Stop"), NO, ^{ [[RYCore shared] stopInvites]; });
-    UIButton *sendNow = RYBtn(T(@"إرسال الآن", @"Send now"), YES, ^{
-        RYCore *c = [RYCore shared]; if (!c.invReadyToSend) return;
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"تأكيد", @"Confirm") message:[NSString stringWithFormat:T(@"إرسال الدعوة لكل الـ %ld اللي اتحددوا؟", @"Send the invite to all %ld selected?"), (long)c.invSent] preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:T(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
-        [a addAction:[UIAlertAction actionWithTitle:T(@"إرسال", @"Send") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [c invSendNow]; }]];
-        [ws presentViewController:a animated:YES completion:nil];
-    });
-    [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYHStack(@[go, stop], 8), sendNow])];
+    [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYHStack(@[go, stop], 8)])];
     [self startInvUI];
 }
 - (void)startInvUI {
@@ -2273,7 +2264,7 @@ static void RYMsgLoopSet(BOOL on) {
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"اسمع صوتي", @"Hear my voice"), 15, UIFontWeightBold, nil), s3], 12)])];
         // ---- amplifier settings
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إعدادات المضخم", @"Amplifier settings"), 15, UIFontWeightBold, nil)])];
-    [self.stack addArrangedSubview:RYSliderV(T(@"التضخيم", @"Gain"), @"dB", 60, 120, [CF(@"distDb", @60) floatValue], NO, 0, ^(float v) { gDistGain = powf(10.f, v / 20.f); CS(@"distDb", @(v)); })];
+    [self.stack addArrangedSubview:RYSliderV(T(@"التضخيم", @"Gain"), @"dB", 0, 120, [CF(@"distDb", @60) floatValue], NO, 0, ^(float v) { gDistGain = powf(10.f, v / 20.f); CS(@"distDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"مستوى الخروج", @"Output"), @"dB", -30, 0, [CF(@"distOutDb", @-3) floatValue], NO, 0, ^(float v) { gDistOut = powf(10.f, v / 20.f); CS(@"distOutDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"عتبة الكتم", @"Gate"), @"dB", -80, -30, [CF(@"distGateDb", @-55) floatValue], NO, 0, ^(float v) { gDistGate = powf(10.f, v / 20.f); CS(@"distGateDb", @(v)); })];
     // ---- room reverb settings (every control of Dragonfly Room Reverb that matters for a mono voice)
@@ -2482,7 +2473,7 @@ static void RYActivateCtl(id b) {
 static NSInteger gInvPendBefore, gInvPendMethod, gInvPendTicks, gInvFail, gInvMethod = -1, gInvSelected, gInvSendWait;
 static BOOL gInvPend, gInvSending, gInvFinalSend, gInvDumped;
 static __weak UIView *gInvPendCell;
-static NSTimeInterval gInvPendT, gInvEndT, gInvChkT, gInvSendUntil; static NSInteger gInvChkBefore; static BOOL gInvChkOn;
+static NSTimeInterval gInvPendT, gInvEndT, gInvChkT, gInvSendUntil, gInvNextT; static NSInteger gInvChkBefore; static BOOL gInvChkOn;
 static NSTimeInterval RYNow(void) { return [NSDate date].timeIntervalSince1970; }
 
 static NSString *RYAsciiDigits(NSString *s) {
@@ -2691,124 +2682,55 @@ static void RYRowDump(UIView *cell) {
 - (NSInteger)invCooldownLeft { if (!gInvLast) return 0; NSInteger l = (NSInteger)(240 - ([NSDate date].timeIntervalSince1970 - gInvLast)); return l > 0 ? l : 0; }
 - (void)stopInvites {
     [gInvTimer invalidate]; gInvTimer = nil;
-    if (self.invRunning || self.invReadyToSend) {
-        self.invRunning = NO; self.invReadyToSend = NO; if (gInvOK > 0) gInvLast = RYNow();
-        self.invStatus = [NSString stringWithFormat:T(@"وقف. حُدّد %ld.", @"Stopped. %ld selected."), (long)self.invSent];
+    if (self.invRunning) {
+        self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow();
+        self.invStatus = [NSString stringWithFormat:T(@"وقف. انرسل %ld.", @"Stopped. %ld sent."), (long)self.invSent];
     }
 }
 - (void)startInvites {
     if (self.invRunning || [self invCooldownLeft] > 0) return;
-    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invReadyToSend = NO; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
-    gInvPend = NO; gInvSending = NO; gInvFinalSend = NO; gInvDumped = NO; gInvFail = 0; gInvSelected = 0; gInvMethod = -1; gInvPendCell = nil;
-    gInvEndT = 0; gInvChkOn = NO; gInvSendUntil = 0;
+    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
+    gInvEndT = 0; gInvNextT = 0;
     gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
 }
 - (void)invFinish:(NSString *)why {
     [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow();
     self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
-    if (gInvOK == 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما تحدد أحد، انسخت التفاصيل", @" - nothing got selected, details copied")]; }
+    if (gInvOK == 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما ارسلت لحد، انسخت التفاصيل", @" - nothing got sent, details copied")]; }
 }
-// selection pass is done (reached the end of the list, or got stuck/refused repeatedly): stop and wait for you to press send yourself
-- (void)invWaitForSend:(NSString *)why {
-    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow();
-    self.invReadyToSend = YES;
-    self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
-}
-- (void)invSendNow {
-    if (!self.invReadyToSend) return;
-    self.invReadyToSend = NO; self.invStatus = T(@"جاري الإرسال…", @"Sending…"); self.invRunning = YES;
-    [self invPressSend:YES];
-    // invPressSend only sets the "sending" flag; restart the ticker so invStep notices gInvSending finish and calls invFinish
-    gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
-}
-// press "Send N invites"; final = the list is finished
-- (void)invPressSend:(BOOL)final {
-    NSInteger c = 0; UIView *b = RYFindSendBtn(&c);
-    BOOL ok = b ? RYTapAncestors(b) : NO;
-    [gInvLog appendFormat:@"send button %@ (%ld selected) pressed=%d\n", b ? NSStringFromClass(b.class) : @"NOT FOUND", (long)c, ok];
-    if (!ok) {
-        UIPasteboard.generalPasteboard.string = gInvLog;
-        [self invFinish:T(@"ما قدرت أضغط زر الإرسال (انسخت التفاصيل). المحدد:", @"Could not press the send button (details copied). Selected:")];
-        return;
-    }
-    self.invStatus = [NSString stringWithFormat:T(@"ضغط إرسال (%ld)", @"Pressed send (%ld)"), (long)c];
-    gInvSending = YES; gInvSendUntil = RYNow() + (final ? 1.2 : 1.5); gInvFinalSend = final; gInvPend = NO; gInvChkOn = NO; gInvSelected = 0; gInvFail = 0;
-}
-// 10 ticks a second. Phase 1 (learning): tick one row at a time and watch the "Send N" counter to find which tap method works.
-// Phase 2 (fast): tick every visible row at once with that method, scroll, repeat (up to 4 screens per tick), check the counter afterwards.
+// one row at a time: find the next not-yet-done row with its own invite button, tap it (one send), wait 0.4s, move on.
+// never batches, never presses a bulk "send all" button — exactly one invite leaves per tap, paced like a person doing it by hand.
 - (void)invStep {
     NSTimeInterval now = RYNow();
-    if (gInvSending) {
-        if (now < gInvSendUntil) return;
-        gInvSending = NO;
-        if (gInvFinalSend) { [self invFinish:T(@"خلصت وانرسلت الدعوات. المحدد:", @"Done, invites sent. Selected:")]; return; }
-    }
+    if (now < gInvNextT) return;
     UIScrollView *sv = RYBiggestList();
-    if (!sv) { if (++gInvIdle > 30) [self invFinish:T(@"ما لقيت قائمة بالشاشة. المحدد:", @"No list on screen. Selected:")]; return; }
-    if (gInvPend) { // learning: did the last tap move the counter?
-        NSInteger c = RYSendCountNow(); UIView *pc = gInvPendCell;
-        if (c > gInvPendBefore) {
-            gInvPend = NO; gInvSelected = c; self.invSent++; gInvOK++; gInvFail = 0; gInvMethod = gInvPendMethod;
-            [gInvLog appendFormat:@"  ticked (method %ld), counter=%ld -> fast mode\n", (long)gInvPendMethod, (long)c];
-        } else if (now - gInvPendT < 0.7) { return; }
-        else {
-            NSInteger m = gInvPendMethod + 1; BOOL again = NO;
-            while (pc && m <= 3) { if (RYSelectRow(sv, pc, m)) { gInvPendMethod = m; gInvPendT = now; again = YES; break; } m++; }
-            if (again) { [gInvLog appendFormat:@"  no change, trying method %ld\n", (long)m]; return; }
-            gInvPend = NO; gInvFail++; [gInvLog appendString:@"  row could not be ticked\n"];
-            if (!gInvDumped && pc) { gInvDumped = YES; RYRowDump(pc); }
-        }
+    if (!sv) { if (++gInvIdle > 30) [self invFinish:T(@"ما لقيت قائمة بالشاشة. انرسل:", @"No list on screen. Sent:")]; return; }
+    UIView *target = nil; id ctl = nil;
+    for (UIView *cell in RYVisibleCells(sv)) {
+        NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
+        if (!key.length) [key appendFormat:@"%p", cell];
+        if ([gInvDone containsObject:key]) continue;
+        id c = RYInviteCtl(cell);
+        if (!c) { [gInvDone addObject:key]; continue; } // no invite button on this row (already invited / not a person row) -> skip for good
+        target = cell; ctl = c; [gInvDone addObject:key]; break;
     }
-    if (gInvChkOn && now - gInvChkT > 0.8) { // fast mode: did the batch move the counter?
-        gInvChkOn = NO; NSInteger c = RYSendCountNow();
-        if (c > gInvChkBefore) { gInvSelected = c; gInvFail = 0; }
-        else { gInvFail += 2; [gInvLog appendFormat:@"batch check: counter %ld did not rise (was %ld)\n", (long)c, (long)gInvChkBefore]; }
-    }
-    if (gInvFail >= 3) { // refused repeatedly: a selection limit (send what we have) or the tap does not reach the circle
-        if (gInvSelected > 0) { [self invWaitForSend:T(@"وقف التحديد (ما قدر يكمل أكثر). اضغط إرسال للمحدد:", @"Selection stopped (could not go further). Press send for the selected:")]; return; }
-        [self invFinish:T(@"ما قدرت أحدد الدايرة. المحدد:", @"Could not tick the circle. Selected:")]; return;
-    }
-    BOOL anyNew = NO;
-    for (int pass = 0; pass < 4; pass++) {
-        NSInteger tapped = 0;
-        for (UIView *cell in RYVisibleCells(sv)) {
-            NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
-            if (!key.length) [key appendFormat:@"%p", cell];
-            if ([gInvDone containsObject:key]) continue;
-            [gInvDone addObject:key]; anyNew = YES;
-            if (gInvMethod < 0) { // learning: one row, then wait for the counter
-                gInvPendBefore = RYSendCountNow(); gInvPendCell = cell; gInvPendT = now;
-                BOOL started = NO;
-                for (NSInteger m = 0; m <= 3; m++) if (RYSelectRow(sv, cell, m)) { gInvPendMethod = m; started = YES; break; }
-                [gInvLog appendFormat:@"row %@ method=%ld started=%d\n", RYClip(key, 30), (long)gInvPendMethod, started];
-                if (!started) { gInvFail++; if (!gInvDumped) { gInvDumped = YES; RYRowDump(cell); } continue; }
-                gInvPend = YES; gInvIdle = 0; gInvEndT = 0;
-                self.invStatus = [NSString stringWithFormat:T(@"أحدد: %@", @"Selecting: %@"), RYClip(key, 24)];
-                return;
-            }
-            if (!gInvChkOn && tapped == 0) gInvChkBefore = RYSendCountNow();
-            if (RYSelectRow(sv, cell, gInvMethod)) tapped++;
-        }
-        if (tapped > 0) {
-            self.invSent += tapped; gInvOK += tapped; gInvIdle = 0;
-            if (!gInvChkOn) { gInvChkOn = YES; gInvChkT = now; }
-            self.invStatus = [NSString stringWithFormat:T(@"حُدّد %ld…", @"Selected %ld…"), (long)self.invSent];
-        }
-        if (gInvMethod < 0) break;
-        CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
-        if (sv.contentOffset.y >= maxY - 2) break;
-        [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
-        [sv layoutIfNeeded];
+    if (target) {
+        RYActivateCtl(ctl);
+        self.invSent++; gInvOK++; gInvIdle = 0; gInvEndT = 0;
+        self.invStatus = [NSString stringWithFormat:T(@"انرسل لـ %ld…", @"Sent to %ld…"), (long)self.invSent];
+        gInvNextT = now + 0.4; // the pacing the user asked for: one person, then wait, then the next
+        return;
     }
     CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
-    if (anyNew) { gInvEndT = 0; return; }
-    if (gInvMethod < 0 || gInvPend) return;
-    if (sv.contentOffset.y >= maxY - 2) { // at the bottom with nothing new: wait a moment (the app may load more rows), then send
+    if (sv.contentOffset.y >= maxY - 2) { // at the bottom with nobody new: wait a moment for more rows to load, then stop
         if (!gInvEndT) gInvEndT = now;
-        if (now - gInvEndT > 1.2 && !gInvChkOn) {
-            if (RYSendCountNow() > 0) [self invWaitForSend:T(@"خلصت القائمة. اضغط إرسال للمحدد:", @"Reached the end. Press send for the selected:")]; else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")];
-        }
-    } else gInvEndT = 0;
+        if (now - gInvEndT > 1.5) [self invFinish:T(@"خلصت القائمة. انرسل:", @"Reached the end. Sent:")];
+    } else {
+        gInvEndT = 0;
+        [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
+        [sv layoutIfNeeded];
+        gInvNextT = now + 0.15; // give the list a moment to lay out the newly-scrolled-in rows before looking again
+    }
 }
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
     UIViewController *room = RYFindVC(CF(@"roomClass", RY_ROOM_DEFAULT));
