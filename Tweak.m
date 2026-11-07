@@ -1357,7 +1357,17 @@ static void RYMonStart(void) {
 }
 static inline void RYMicFx(float *t, int c, double sr, RYVS *s) {
     if (gMicMute) { memset(t, 0, (size_t)c * sizeof(float)); return; } // overrides everything else, Stereo included, on purpose
-    if (gStOn) RYStFeed(t, c, sr); else if (RY_FX_ON) RYVoiceBlock(t, c, sr, s);
+    if (gStOn) {
+        static __thread float tmp[8192]; int done = 0;
+        while (done < c) {
+            int n = MIN(c - done, 8192);
+            memcpy(tmp, t + done, (size_t)n * sizeof(float));
+            RYVoiceBlock(tmp, n, sr, s);                 // tmp = your real voice, exactly as it would normally sound (or raw if no effect is on)
+            RYStFeed(t + done, n, sr);                    // t[] = the Stereo file, at full clarity
+            for (int i = 0; i < n; i++) { float v = t[done + i] + tmp[i] * 0.55f; t[done + i] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); }
+            done += n;
+        }
+    } else if (RY_FX_ON) RYVoiceBlock(t, c, sr, s);
     if (gMonOn) RYMonFeed(t, c, sr);
 }
 // interleaved: channel 0 is processed and copied to the other channels
@@ -2016,6 +2026,7 @@ static void RYMsgLoopSet(BOOL on) {
 @property (nonatomic, strong) UIStackView *stack;
 @property (nonatomic, strong) UILabel *invLabel;
 @property (nonatomic, strong) NSTimer *invUI;
+@property (nonatomic, strong) NSString *pickPurpose; // routes the shared PHPicker callback: nil/"bg" = background image, "stereo" = Stereo video
 @end
 
 @implementation RYPanel
@@ -2116,7 +2127,7 @@ static void RYMsgLoopSet(BOOL on) {
 - (void)renderBG {
     __weak typeof(self) ws = self;
     UIButton *photo = RYBtn(T(@"من الاستوديو", @"Photo library"), YES, ^{
-        PHPickerConfiguration *c = [PHPickerConfiguration new]; c.filter = [PHPickerFilter imagesFilter]; c.selectionLimit = 1;
+        ws.pickPurpose = @"bg"; PHPickerConfiguration *c = [PHPickerConfiguration new]; c.filter = [PHPickerFilter imagesFilter]; c.selectionLimit = 1;
         PHPickerViewController *p = [[PHPickerViewController alloc] initWithConfiguration:c]; p.delegate = ws; [ws presentViewController:p animated:YES completion:nil];
     });
     UIButton *url = RYBtn(T(@"رابط صورة", @"Image URL"), NO, ^{
@@ -2167,6 +2178,20 @@ static void RYMsgLoopSet(BOOL on) {
     [picker dismissViewControllerAnimated:YES completion:nil];
     PHPickerResult *r = results.firstObject; if (!r) return;
     __weak typeof(self) ws = self;
+    if ([self.pickPurpose isEqualToString:@"stereo"]) {
+        [r.itemProvider loadFileRepresentationForTypeIdentifier:@"public.movie" completionHandler:^(NSURL *u, NSError *e) {
+            if (!u) { dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"تعذر فتح الفيديو", @"Could not open the video")]; }); return; }
+            NSString *dst = [RYDir(@"data") stringByAppendingPathComponent:[@"stereo." stringByAppendingString:(u.pathExtension.length ? u.pathExtension : @"mov")]];
+            [NSFileManager.defaultManager removeItemAtPath:dst error:nil];
+            NSError *cp = nil; [NSFileManager.defaultManager copyItemAtURL:u toURL:[NSURL fileURLWithPath:dst] error:&cp];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (cp) { [ws toast:T(@"تعذر فتح الفيديو", @"Could not open the video")]; return; }
+                CS(@"stName", u.lastPathComponent); CS(@"stFile", dst.lastPathComponent); [ws toast:T(@"جاري التحميل…", @"Loading…")];
+                RYStDecode([NSURL fileURLWithPath:dst], ^(BOOL ok, NSString *msg) { [ws toast:msg ?: (ok ? T(@"جاهز", @"Ready") : T(@"تعذر التحميل", @"Could not load"))]; [ws rebuild]; });
+            });
+        }];
+        return;
+    }
     [r.itemProvider loadDataRepresentationForTypeIdentifier:@"public.image" completionHandler:^(NSData *d, NSError *e) { [ws saveBGData:d]; }];
 }
 - (void)colorPickerViewController:(UIColorPickerViewController *)vc didSelectColor:(UIColor *)color continuously:(BOOL)c { [self setBG:@"color" value:RYHexFrom(color)]; }
@@ -2191,18 +2216,36 @@ static void RYMsgLoopSet(BOOL on) {
         NSString *f = [RYDir(@"data") stringByAppendingPathComponent:CF(@"stFile", @"")];
         if ([NSFileManager.defaultManager fileExistsAtPath:f]) RYStDecode([NSURL fileURLWithPath:f], ^(BOOL ok, NSString *msg) { if (ok) [ws rebuild]; });
     }
-    UIButton *choose = RYBtn(T(@"اختيار ملف", @"Choose file"), NO, ^{
+    UIButton *choose = RYBtn(T(@"ملف", @"File"), NO, ^{
         UIDocumentPickerViewController *dp = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.audio", @"public.movie", @"public.mpeg-4", @"public.mp3", @"com.microsoft.waveform-audio", @"public.mpeg-4-audio"] inMode:UIDocumentPickerModeImport];
         dp.delegate = ws; [ws presentViewController:dp animated:YES completion:nil];
+    });
+    UIButton *gallery = RYBtn(T(@"الجاليري", @"Gallery"), NO, ^{
+        ws.pickPurpose = @"stereo";
+        PHPickerConfiguration *c = [PHPickerConfiguration new]; c.filter = [PHPickerFilter videosFilter]; c.selectionLimit = 1;
+        PHPickerViewController *p = [[PHPickerViewController alloc] initWithConfiguration:c]; p.delegate = ws; [ws presentViewController:p animated:YES completion:nil];
     });
     UIButton *remove = RYBtn(T(@"حذف", @"Remove"), NO, ^{
         RYStFree(); NSString *f = CF(@"stFile", nil);
         if (f) [NSFileManager.defaultManager removeItemAtPath:[RYDir(@"data") stringByAppendingPathComponent:f] error:nil];
         CS(@"stName", nil); CS(@"stFile", nil); [ws rebuild];
     });
+    UIButton *saveShortcut = RYBtn(T(@"حفظ كاختصار", @"Save as shortcut"), NO, ^{
+        NSString *f = CF(@"stFile", nil);
+        if (!f) { [ws toast:T(@"حمّل ملف أول", @"Load a file first")]; return; }
+        [ws ask:T(@"اسم الاختصار", @"Shortcut name") ph:(nm ?: @"") secure:NO ok:^(NSString *name) {
+            NSString *ext = f.pathExtension.length ? f.pathExtension : @"dat";
+            NSString *clipFile = [NSString stringWithFormat:@"stclip-%@.%@", [NSUUID UUID].UUIDString, ext];
+            NSError *cp = nil; [NSFileManager.defaultManager copyItemAtPath:[RYDir(@"data") stringByAppendingPathComponent:f] toPath:[RYDir(@"data") stringByAppendingPathComponent:clipFile] error:&cp];
+            if (cp) { [ws toast:T(@"تعذر الحفظ", @"Could not save")]; return; }
+            NSMutableArray *clips = [CF(@"stClips", @[]) mutableCopy];
+            [clips addObject:@{@"name": name.length ? name : (nm ?: @"Clip"), @"file": clipFile}];
+            CS(@"stClips", clips); [ws toast:T(@"تم الحفظ كاختصار", @"Saved as a shortcut")]; [ws rebuild];
+        }];
+    });
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"ملف الصوت أو الفيديو", @"Audio/video file"), 16, UIFontWeightBold, nil),
         RYLabel(gStLoading ? T(@"جاري التحميل…", @"Loading…") : (nm ?: T(@"ما فيه ملف", @"No file")), 13, UIFontWeightMedium, RY_MUTED),
-        RYHStack(@[choose, remove], 8)])];
+        RYHStack(@[choose, gallery, remove], 8), saveShortcut])];
     UISwitch *lp = [UISwitch new]; lp.on = gStLoop != 0; lp.onTintColor = RYAccent(); __weak UISwitch *wlp = lp;
     [lp addAction:[UIAction actionWithHandler:^(UIAction *a) { gStLoop = wlp.on; CS(@"stLoop", @(wlp.on)); }] forControlEvents:UIControlEventValueChanged];
     UIButton *play = RYBtn(gStOn ? T(@"إيقاف", @"Stop") : T(@"تشغيل بالمايك", @"Play through mic"), gStOn, ^{
@@ -2212,6 +2255,29 @@ static void RYMsgLoopSet(BOOL on) {
     });
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تكرار", @"Loop"), 14, UIFontWeightMedium, nil), lp], 12), play])];
     [self.stack addArrangedSubview:RYSlider(T(@"مستوى الصوت", @"Volume"), 0, 2, gStVol, ^(float v) { gStVol = v; CS(@"stVol", @(v)); })];
+    NSArray *clips = CF(@"stClips", @[]);
+    if (clips.count) {
+        NSMutableArray *rows = [NSMutableArray arrayWithObject:RYLabel(T(@"الاختصارات المحفوظة", @"Saved shortcuts"), 16, UIFontWeightBold, nil)];
+        for (NSDictionary *clip in clips) {
+            NSString *cfile = clip[@"file"], *cname = clip[@"name"];
+            UIButton *cplay = RYBtn(T(@"تشغيل", @"Play"), NO, ^{
+                NSString *path = [RYDir(@"data") stringByAppendingPathComponent:cfile];
+                if (![NSFileManager.defaultManager fileExistsAtPath:path]) { [ws toast:T(@"الملف مفقود", @"File missing")]; return; }
+                [ws toast:T(@"جاري التحميل…", @"Loading…")];
+                RYStDecode([NSURL fileURLWithPath:path], ^(BOOL ok, NSString *msg) {
+                    if (!ok) { [ws toast:msg ?: T(@"تعذر التحميل", @"Could not load")]; return; }
+                    CS(@"stName", cname); CS(@"stFile", cfile); gStPos = 0; gStOn = 1; [ws rebuild];
+                });
+            });
+            UIButton *cdel = RYBtn(T(@"حذف", @"Remove"), NO, ^{
+                [NSFileManager.defaultManager removeItemAtPath:[RYDir(@"data") stringByAppendingPathComponent:cfile] error:nil];
+                NSMutableArray *left = [NSMutableArray new]; for (NSDictionary *x in CF(@"stClips", @[])) if (![x[@"file"] isEqual:cfile]) [left addObject:x];
+                CS(@"stClips", left); [ws rebuild];
+            });
+            [rows addObject:RYHStack(@[RYLabel(cname, 14, UIFontWeightMedium, nil), cplay, cdel], 8)];
+        }
+        [self.stack addArrangedSubview:RYCard(rows)];
+    }
 }
 
 #pragma mark Invites
@@ -2512,6 +2578,7 @@ static void RYMsgLoopSet(BOOL on) {
 
 #pragma mark Invites engine
 static NSMutableSet *gInvDone; static int gInvIdle; static NSTimer *gInvTimer; static NSTimeInterval gInvLast;
+static NSMutableDictionary<NSString *, NSNumber *> *gInvRetry; // key -> misses so far, before giving up on that row
 static __weak UIScrollView *gInvSV; // locked once found: keeps scrolling the SAME list even after its visible rows stop "having an invite button"
 static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv);
 static id RYInviteCtl(UIView *cell);
@@ -2556,8 +2623,14 @@ static void RYCellTexts(UIView *v, NSMutableString *o, int d) {
     if ([v isKindOfClass:UILabel.class] && ((UILabel *)v).text.length) [o appendFormat:@"%@|", ((UILabel *)v).text];
     for (UIView *s in v.subviews) RYCellTexts(s, o, d + 1);
 }
-// the invite control inside a row: key contains an invite word, and none of the "already done" words
+static id RYSafeKVC(id obj, NSString *key) { if (!obj || !key) return nil; @try { return [obj valueForKey:key]; } @catch (__unused id e) { return nil; } }
+// the invite control inside a row: first try the real outlet name found in Rave's own binary (works no matter what the
+// button's text/icon/language is), then fall back to guessing by key text for any cell type that doesn't have it.
 static id RYInviteCtl(UIView *cell) {
+    for (NSString *k in @[@"outletInviteButton", @"inviteButton", @"inviteFriendButton", @"addButton", @"outletAddButton"]) {
+        id v = RYSafeKVC(cell, k);
+        if ([v isKindOfClass:UIControl.class]) { UIControl *b = v; if (b.window && !b.hidden && b.alpha > 0.01 && b.userInteractionEnabled) return b; }
+    }
     NSMutableArray *c = [NSMutableArray new]; RYCollectCtl(cell, c, 0);
     NSArray *good = @[@"invite", @"دعو", @"دعوه", @"add to room", @"person.badge.plus", @"plus"];
     NSArray *bad = @[@"invited", @"تمت", @"تم ", @"sent", @"pending", @"remove", @"block", @"report", @"unfriend", @"chat", @"message", @"cancel", @"cancelinvite", @"cancelfriendinvite", @"delete", @"decline", @"deny"];
@@ -2824,7 +2897,7 @@ static void RYRowDump(UIView *cell) {
 }
 - (void)startInvites {
     if (self.invRunning || [self invCooldownLeft] > 0) return;
-    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; gInvSV = nil; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
+    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; gInvSV = nil; gInvRetry = [NSMutableDictionary new]; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
     gInvEndT = 0; gInvNextT = 0;
     gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
 }
@@ -2846,7 +2919,11 @@ static void RYRowDump(UIView *cell) {
         if (!key.length) [key appendFormat:@"%p", cell];
         if ([gInvDone containsObject:key]) continue;
         id c = RYInviteCtl(cell);
-        if (!c) { [gInvDone addObject:key]; continue; } // no invite button on this row (already invited / not a person row) -> skip for good
+        if (!c) {
+            NSNumber *miss = gInvRetry[key];
+            if (!miss) { gInvRetry[key] = @1; continue; } // first miss: try again next tick instead of giving up immediately
+            [gInvDone addObject:key]; continue; // missed twice: no invite button on this row for real (already invited / not a person row)
+        }
         target = cell; ctl = c; [gInvDone addObject:key]; break;
     }
     if (target) {
