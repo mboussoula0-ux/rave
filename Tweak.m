@@ -30,6 +30,7 @@
 #import <mach-o/nlist.h>
 #import <sqlite3.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <CoreMedia/CoreMedia.h>
 #import <os/lock.h>
 
 #pragma mark - Config / storage
@@ -1146,7 +1147,71 @@ static volatile long long gMicCallsA = 0, gMicCallsU = 0, gMicCallsT = 0, gMicPr
 static volatile int gMicRebound = 0, gMicWrapped = 0, gMicTapInst = 0;
 static volatile int gMicDist = 0, gMicRev = 0, gMonOn = 0;
 static volatile int gMicMute = 0; // "سكر صوتي": hard-silences the mic no matter what else is on
-#define RY_FX_ON (gMicOn || gMicDist || gMicRev || gMicMute)   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch
+
+// ---- Stereo: play an imported audio/video file through the mic instead of the real voice (kill-mic still overrides it, see RYMicFx)
+static float *gStBuf = NULL; static long gStLen = 0; static double gStPos = 0, gStRate = 48000;
+static volatile int gStOn = 0, gStLoop = 0; static float gStVol = 1.f; static volatile int gStLoading = 0;
+static void RYStStop(void) { gStOn = 0; }
+static void RYStFree(void) { if (gStBuf) { free(gStBuf); gStBuf = NULL; } gStLen = 0; gStPos = 0; gStOn = 0; }
+// linear-resampled playback into the real mic buffer: t[] is mono float32, c frames, sr is the real callback rate (gStRate is the decoded file's rate)
+static inline void RYStFeed(float *t, int c, double sr) {
+    if (!gStBuf || gStLen <= 1) { gStOn = 0; return; }
+    double step = gStRate / (sr > 0 ? sr : gStRate);
+    for (int i = 0; i < c; i++) {
+        if (!gStOn) { t[i] = 0.f; continue; }
+        long i0 = (long)gStPos;
+        if (i0 >= gStLen - 1) {
+            if (gStLoop) { gStPos = 0; i0 = 0; } else { gStOn = 0; t[i] = 0.f; continue; }
+        }
+        double frac = gStPos - (double)i0;
+        float a = gStBuf[i0], b = gStBuf[MIN(i0 + 1, gStLen - 1)];
+        t[i] = (a + (b - a) * (float)frac) * gStVol;
+        gStPos += step;
+    }
+}
+// decodes any file AVFoundation can open (mp3/mp4/mov/wav/m4a...) to mono float32 PCM, off the audio thread. 4-minute hard cap.
+static void RYStDecode(NSURL *u, void (^done)(BOOL ok, NSString *msg)) {
+    gStLoading = 1;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        AVAsset *asset = [AVAsset assetWithURL:u];
+        NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeAudio];
+        if (!tracks.count) { dispatch_async(dispatch_get_main_queue(), ^{ gStLoading = 0; done(NO, T(@"ما فيه صوت بالملف", @"No audio track in this file")); }); return; }
+        NSError *err = nil; AVAssetReader *rd = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+        if (!rd) { dispatch_async(dispatch_get_main_queue(), ^{ gStLoading = 0; done(NO, err.localizedDescription ?: @"reader"); }); return; }
+        const double rate = 48000;
+        NSDictionary *settings = @{ AVFormatIDKey: @(kAudioFormatLinearPCM), AVSampleRateKey: @(rate), AVNumberOfChannelsKey: @1,
+            AVLinearPCMBitDepthKey: @32, AVLinearPCMIsFloatKey: @YES, AVLinearPCMIsNonInterleaved: @NO, AVLinearPCMIsBigEndianKey: @NO };
+        AVAssetReaderTrackOutput *out = [[AVAssetReaderTrackOutput alloc] initWithTrack:tracks.firstObject outputSettings:settings];
+        if (![rd canAddOutput:out]) { dispatch_async(dispatch_get_main_queue(), ^{ gStLoading = 0; done(NO, T(@"صيغة غير مدعومة", @"Unsupported format")); }); return; }
+        [rd addOutput:out];
+        if (![rd startReading]) { dispatch_async(dispatch_get_main_queue(), ^{ gStLoading = 0; done(NO, rd.error.localizedDescription ?: @"start"); }); return; }
+        long cap = (long)(rate * 240); // hard cap: 4 minutes of mono float32 (~3.8MB/min)
+        float *buf = (float *)malloc(sizeof(float) * (size_t)cap); long len = 0; BOOL truncated = NO;
+        CMSampleBufferRef sb;
+        while (buf && rd.status == AVAssetReaderStatusReading && (sb = [out copyNextSampleBuffer])) {
+            CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+            size_t totalLen = 0; char *ptr = NULL;
+            if (bb && CMBlockBufferGetDataPointer(bb, 0, NULL, &totalLen, &ptr) == kCMBlockBufferNoErr && ptr) {
+                long n = (long)(totalLen / sizeof(float));
+                if (len + n > cap) { n = cap - len; truncated = YES; }
+                if (n > 0) { memcpy(buf + len, ptr, (size_t)n * sizeof(float)); len += n; }
+            }
+            CFRelease(sb);
+            if (len >= cap) break;
+        }
+        BOOL ok = buf != NULL && len > 0 && rd.status != AVAssetReaderStatusFailed;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gStLoading = 0;
+            if (!ok) { if (buf) free(buf); done(NO, rd.error.localizedDescription ?: T(@"تعذرت القراءة", @"Could not decode")); return; }
+            RYStFree();
+            gStBuf = (float *)realloc(buf, sizeof(float) * (size_t)len); if (!gStBuf) gStBuf = buf;
+            gStLen = len; gStPos = 0; gStRate = rate;
+            done(YES, truncated ? T(@"جاهز (انقص لأول 4 دقايق)", @"Ready (trimmed to the first 4 minutes)") : T(@"جاهز", @"Ready"));
+        });
+    });
+}
+
+#define RY_FX_ON (gMicOn || gMicDist || gMicRev || gMicMute || gStOn)   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch; Stereo file playback also needs the pipeline live
 enum { RV_DRY, RV_ELVL, RV_ESEND, RV_LLVL, RV_SIZE, RV_PRE, RV_DECAY, RV_DIFF, RV_SPIN, RV_WANDER, RV_HC, RV_EDAMP, RV_LDAMP, RV_LC, RV_LB, RV_BF, RV_N };
 static const float kRvDef[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600}; // the Dragonfly Room Reverb values from the screenshot
 static volatile float gRv[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600};
@@ -1290,7 +1355,11 @@ static void RYMonStart(void) {
         });
     });
 }
-static inline void RYMicFx(float *t, int c, double sr, RYVS *s) { if (RY_FX_ON) RYVoiceBlock(t, c, sr, s); if (gMonOn) RYMonFeed(t, c, sr); }
+static inline void RYMicFx(float *t, int c, double sr, RYVS *s) {
+    if (gMicMute) { memset(t, 0, (size_t)c * sizeof(float)); return; } // overrides everything else, Stereo included, on purpose
+    if (gStOn) RYStFeed(t, c, sr); else if (RY_FX_ON) RYVoiceBlock(t, c, sr, s);
+    if (gMonOn) RYMonFeed(t, c, sr);
+}
 // interleaved: channel 0 is processed and copied to the other channels
 static void RYProcInter(void *data, BOOL isFloat, UInt32 frames, UInt32 ch, double sr, RYVS *s) {
     if (!data || !ch) return; float tmp[2048]; UInt32 done = 0;
@@ -1535,6 +1604,7 @@ static void RYMicLoad(void) {
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicPreset = [CF(@"micPreset", @0) intValue]; gMicSemi = [CF(@"micSemi", @0) floatValue];
     gMicMode = [CF(@"micMode", @0) intValue]; gMicEcho = [CF(@"micEcho", @0) floatValue]; gMicGain = [CF(@"micGain", @1) floatValue];
     gMicDist = [CF(@"micDist", @NO) boolValue]; gMicRev = [CF(@"micRev", @NO) boolValue]; gMicMute = 0; // never restore "on": always starts unmuted so it's never silently stuck
+    gStLoop = [CF(@"stLoop", @NO) boolValue]; gStVol = [CF(@"stVol", @1.0) floatValue];
     { NSArray *rc = CF(@"revCfg", nil); // the saved echo settings only count if they were saved with the current defaults (version 2); otherwise start from the Dragonfly values
       if ([CF(@"revCfgVer", @0) intValue] == 2 && [rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue];
       else { NSMutableArray *d = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) { gRv[i] = kRvDef[i]; [d addObject:@(kRvDef[i])]; } CS(@"revCfg", d); CS(@"revCfgVer", @2); } }
@@ -1925,7 +1995,7 @@ static void RYMsgLoopStep(NSInteger gen) {
     if (!msgs.count) { gMsgLoop = NO; RYBGRenew(NO); return; }
     if (gMsgIdx >= msgs.count) gMsgIdx = 0;
     NSString *m = msgs[gMsgIdx++];
-    double delay = MAX(2.0, [CF(@"msgDelay", @4.0) doubleValue]); // never faster than every 2 seconds
+    double delay = MAX(0.4, [CF(@"msgDelay", @4.0) doubleValue]); // 0.4s floor
     [[RYCore shared] sendMessage:m done:^(NSInteger code) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!gMsgLoop || gen != gMsgGen) return;
@@ -1980,10 +2050,10 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الإعدادات", @"Settings"), T(@"دخول برابط", @"Join link"), T(@"مايك", @"Mic")];
+    NSArray *names = @[T(@"الخلفيات", @"Backgrounds"), T(@"الدعوات", @"Invites"), T(@"رسائل سريعة", @"Quick messages"), T(@"الإعدادات", @"Settings"), T(@"دخول برابط", @"Join link"), T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo")];
     // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
-    NSArray<NSNumber *> *order = @[@0, @1, @2, @5, @4, @3];
-    if (self.tab < 0 || self.tab > 5) self.tab = 0;
+    NSArray<NSNumber *> *order = @[@0, @1, @2, @5, @6, @4, @3];
+    if (self.tab < 0 || self.tab > 6) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -2013,7 +2083,7 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 4: [self renderJoin]; break; case 5: [self renderMic]; break; default: [self renderSettings]; }
+    switch (self.tab) { case 0: [self renderBG]; break; case 1: [self renderInvites]; break; case 2: [self renderMsgs]; break; case 4: [self renderJoin]; break; case 5: [self renderMic]; break; case 6: [self renderStereo]; break; default: [self renderSettings]; }
 }
 
 #pragma mark Saved deleted messages
@@ -2101,6 +2171,49 @@ static void RYMsgLoopSet(BOOL on) {
 }
 - (void)colorPickerViewController:(UIColorPickerViewController *)vc didSelectColor:(UIColor *)color continuously:(BOOL)c { [self setBG:@"color" value:RYHexFrom(color)]; }
 
+#pragma mark Stereo (play a file through the mic)
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *u = urls.firstObject; if (!u) return;
+    __weak typeof(self) ws = self;
+    NSString *ext = u.pathExtension.length ? u.pathExtension : @"dat";
+    NSString *dst = [RYDir(@"data") stringByAppendingPathComponent:[@"stereo." stringByAppendingString:ext]];
+    [NSFileManager.defaultManager removeItemAtPath:dst error:nil];
+    NSError *cpErr = nil; [NSFileManager.defaultManager copyItemAtURL:u toURL:[NSURL fileURLWithPath:dst] error:&cpErr];
+    if (cpErr) { [self toast:T(@"تعذر فتح الملف", @"Could not open the file")]; return; }
+    CS(@"stName", u.lastPathComponent); CS(@"stFile", dst.lastPathComponent);
+    [self toast:T(@"جاري التحميل…", @"Loading…")];
+    RYStDecode([NSURL fileURLWithPath:dst], ^(BOOL ok, NSString *msg) { [ws toast:msg ?: (ok ? T(@"جاهز", @"Ready") : T(@"تعذر التحميل", @"Could not load"))]; [ws rebuild]; });
+}
+- (void)renderStereo {
+    __weak typeof(self) ws = self;
+    NSString *nm = CF(@"stName", nil);
+    if (!gStBuf && !gStLoading && CF(@"stFile", nil)) { // relaunch: redecode the cached copy the first time this tab is opened
+        NSString *f = [RYDir(@"data") stringByAppendingPathComponent:CF(@"stFile", @"")];
+        if ([NSFileManager.defaultManager fileExistsAtPath:f]) RYStDecode([NSURL fileURLWithPath:f], ^(BOOL ok, NSString *msg) { if (ok) [ws rebuild]; });
+    }
+    UIButton *choose = RYBtn(T(@"اختيار ملف", @"Choose file"), NO, ^{
+        UIDocumentPickerViewController *dp = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.audio", @"public.movie", @"public.mpeg-4", @"public.mp3", @"com.microsoft.waveform-audio", @"public.mpeg-4-audio"] inMode:UIDocumentPickerModeImport];
+        dp.delegate = ws; [ws presentViewController:dp animated:YES completion:nil];
+    });
+    UIButton *remove = RYBtn(T(@"حذف", @"Remove"), NO, ^{
+        RYStFree(); NSString *f = CF(@"stFile", nil);
+        if (f) [NSFileManager.defaultManager removeItemAtPath:[RYDir(@"data") stringByAppendingPathComponent:f] error:nil];
+        CS(@"stName", nil); CS(@"stFile", nil); [ws rebuild];
+    });
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"ملف الصوت أو الفيديو", @"Audio/video file"), 16, UIFontWeightBold, nil),
+        RYLabel(gStLoading ? T(@"جاري التحميل…", @"Loading…") : (nm ?: T(@"ما فيه ملف", @"No file")), 13, UIFontWeightMedium, RY_MUTED),
+        RYHStack(@[choose, remove], 8)])];
+    UISwitch *lp = [UISwitch new]; lp.on = gStLoop != 0; lp.onTintColor = RYAccent(); __weak UISwitch *wlp = lp;
+    [lp addAction:[UIAction actionWithHandler:^(UIAction *a) { gStLoop = wlp.on; CS(@"stLoop", @(wlp.on)); }] forControlEvents:UIControlEventValueChanged];
+    UIButton *play = RYBtn(gStOn ? T(@"إيقاف", @"Stop") : T(@"تشغيل بالمايك", @"Play through mic"), gStOn, ^{
+        if (!gStBuf || gStLen <= 1) { [ws toast:T(@"اختر ملف أول", @"Choose a file first")]; return; }
+        if (gStOn) { gStOn = 0; } else { gStPos = 0; gStOn = 1; }
+        [ws rebuild];
+    });
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تكرار", @"Loop"), 14, UIFontWeightMedium, nil), lp], 12), play])];
+    [self.stack addArrangedSubview:RYSlider(T(@"مستوى الصوت", @"Volume"), 0, 2, gStVol, ^(float v) { gStVol = v; CS(@"stVol", @(v)); })];
+}
+
 #pragma mark Invites
 - (NSString *)invText {
     RYCore *c = [RYCore shared];
@@ -2144,7 +2257,17 @@ static void RYMsgLoopSet(BOOL on) {
     }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"إرسال كل الرسائل بتكرار", @"Loop all messages"), 15, UIFontWeightBold, nil), lp], 12),
         lst])];
-    [self.stack addArrangedSubview:RYSlider(T(@"الفاصل بين الرسائل (ثواني)", @"Delay between messages (seconds)"), 2, 15, [CF(@"msgDelay", @4.0) floatValue], ^(float v) { CS(@"msgDelay", @(v)); })];
+    { __block UILabel *wdl; UILabel *dl = RYLabel([NSString stringWithFormat:T(@"الفاصل بين الرسائل: %.1f ثانية", @"Delay between messages: %.1fs"), MAX(0.4, [CF(@"msgDelay", @4.0) floatValue])], 14, UIFontWeightMedium, nil); wdl = dl;
+      UISlider *dsl = [UISlider new]; dsl.minimumValue = 0.4; dsl.maximumValue = 30; dsl.value = MIN(30, MAX(0.4, [CF(@"msgDelay", @4.0) floatValue])); dsl.minimumTrackTintColor = RYAccent(); __weak UISlider *wdsl = dsl;
+      [dsl addAction:[UIAction actionWithHandler:^(UIAction *a) { float v = wdsl.value; CS(@"msgDelay", @(v)); wdl.text = [NSString stringWithFormat:T(@"الفاصل بين الرسائل: %.1f ثانية", @"Delay between messages: %.1fs"), v]; }] forControlEvents:UIControlEventValueChanged];
+      UIButton *custom = RYBtn(T(@"اكتب رقم (بدون حد أعلى)", @"Type a number (no upper limit)"), NO, ^{
+          [ws ask:T(@"الثواني", @"Seconds") ph:@"4.0" secure:NO ok:^(NSString *x) {
+              float v = [x floatValue]; if (v < 0.4f) v = 0.4f; CS(@"msgDelay", @(v));
+              wdl.text = [NSString stringWithFormat:T(@"الفاصل بين الرسائل: %.1f ثانية", @"Delay between messages: %.1fs"), v];
+              wdsl.value = MIN(30, v);
+          }];
+      });
+      [self.stack addArrangedSubview:RYCard(@[dl, dsl, custom])]; }
     self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
         ws.invLabel.text = gMsgLoop ? [NSString stringWithFormat:T(@"شغّال... انرسل %lu", @"Running... sent %lu"), (unsigned long)gMsgSent] : T(@"متوقف", @"Stopped");
         if (!gMsgLoop && wlp.on) wlp.on = NO;
@@ -2389,6 +2512,7 @@ static void RYMsgLoopSet(BOOL on) {
 
 #pragma mark Invites engine
 static NSMutableSet *gInvDone; static int gInvIdle; static NSTimer *gInvTimer; static NSTimeInterval gInvLast;
+static __weak UIScrollView *gInvSV; // locked once found: keeps scrolling the SAME list even after its visible rows stop "having an invite button"
 static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv);
 static id RYInviteCtl(UIView *cell);
 static UIScrollView *RYListIn(UIView *root) {
@@ -2404,13 +2528,24 @@ static UIScrollView *RYListIn(UIView *root) {
     return best;
 }
 // prefer the visible invite-friends screen; the room chat list is bigger and would win otherwise
-static UIScrollView *RYBiggestList(void) {
+static UIScrollView *RYBiggestListFind(void) {
     NSMutableArray *vcs = [NSMutableArray new];
     for (UIWindow *w in RYAppWindows()) RYScanAll(w.rootViewController, CF(@"inviteClass", @"FriendsManagementViewController"), 0, vcs);
     for (UIViewController *vc in vcs) { if (!RYVisible(vc.view)) continue; UIScrollView *l = RYListIn(vc.view); if (l) return l; }
     UIScrollView *best = nil;
     for (UIWindow *w in RYAppWindows()) { UIScrollView *x = RYListIn(w); if (x) { best = x; break; } }
     return best;
+}
+// RYListIn only trusts a list that currently has a VISIBLE invite button, to avoid picking a bigger unrelated scroll view.
+// But once every currently-visible row in the real list has been ticked, it has none left on screen (the rest are further down,
+// off-screen) and that same check would wrongly hand the run to a different, bigger view — which is why scrolling used to stop.
+// Fix: once a list is found for this run, keep using that exact instance for the whole run instead of searching again every tick.
+static UIScrollView *RYBiggestList(void) {
+    UIScrollView *locked = gInvSV;
+    if (locked && locked.window && RYVisible(locked)) return locked;
+    UIScrollView *found = RYBiggestListFind();
+    gInvSV = found;
+    return found;
 }
 static NSArray<UIView *> *RYVisibleCells(UIScrollView *sv) {
     if ([sv isKindOfClass:UITableView.class]) return ((UITableView *)sv).visibleCells;
@@ -2689,7 +2824,7 @@ static void RYRowDump(UIView *cell) {
 }
 - (void)startInvites {
     if (self.invRunning || [self invCooldownLeft] > 0) return;
-    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
+    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; gInvSV = nil; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
     gInvEndT = 0; gInvNextT = 0;
     gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
 }
