@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 LIBRARY_NAME = 8ubah
 8ubah_FILES = Tweak.m
 8ubah_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-format-security -Wno-unused-function -Wno-error
-8ubah_FRAMEWORKS = UIKit Foundation AVFoundation AudioToolbox PhotosUI ImageIO UniformTypeIdentifiers CoreLocation
+8ubah_FRAMEWORKS = UIKit Foundation AVFoundation AudioToolbox CoreMedia PhotosUI ImageIO UniformTypeIdentifiers CoreLocation
 8ubah_LIBRARIES = sqlite3
 8ubah_INSTALL_PATH = @rpath
 
