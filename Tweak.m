@@ -1152,6 +1152,14 @@ static volatile int gMicMute = 0; // "سكر صوتي": hard-silences the mic no
 static float *gStBuf = NULL; static long gStLen = 0; static double gStPos = 0, gStRate = 48000;
 static volatile int gStOn = 0, gStLoop = 0; static float gStVol = 1.f; static volatile int gStLoading = 0;
 static void RYStStop(void) { gStOn = 0; }
+static double RYStDuration(void) { return gStLen > 1 ? (double)gStLen / gStRate : 0; } // seconds
+static double RYStPosSec(void) { return gStRate > 0 ? gStPos / gStRate : 0; }          // seconds
+static void RYStSeek(double seconds) {
+    if (gStLen <= 1) return;
+    double p = seconds * gStRate;
+    if (p < 0) p = 0; if (p > gStLen - 1) p = gStLen - 1;
+    gStPos = p;
+}
 static void RYStFree(void) { if (gStBuf) { free(gStBuf); gStBuf = NULL; } gStLen = 0; gStPos = 0; gStOn = 0; }
 // linear-resampled playback into the real mic buffer: t[] is mono float32, c frames, sr is the real callback rate (gStRate is the decoded file's rate)
 static inline void RYStFeed(float *t, int c, double sr) {
@@ -1356,18 +1364,20 @@ static void RYMonStart(void) {
     });
 }
 static inline void RYMicFx(float *t, int c, double sr, RYVS *s) {
-    if (gMicMute) { memset(t, 0, (size_t)c * sizeof(float)); return; } // overrides everything else, Stereo included, on purpose
     if (gStOn) {
+        // "سكر صوتي" only has to silence YOUR voice, not the Stereo file: RYStFeed always runs here regardless of gMicMute,
+        // and RYVoiceBlock (called below on tmp, your real voice) already zeroes itself out on its own when gMicMute is on.
         static __thread float tmp[8192]; int done = 0;
         while (done < c) {
             int n = MIN(c - done, 8192);
             memcpy(tmp, t + done, (size_t)n * sizeof(float));
-            RYVoiceBlock(tmp, n, sr, s);                 // tmp = your real voice, exactly as it would normally sound (or raw if no effect is on)
-            RYStFeed(t + done, n, sr);                    // t[] = the Stereo file, at full clarity
+            RYVoiceBlock(tmp, n, sr, s);                 // tmp = your real voice, exactly as it would normally sound (silence if muted)
+            RYStFeed(t + done, n, sr);                    // t[] = the Stereo file, always at full clarity
             for (int i = 0; i < n; i++) { float v = t[done + i] + tmp[i] * 0.55f; t[done + i] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); }
             done += n;
         }
-    } else if (RY_FX_ON) RYVoiceBlock(t, c, sr, s);
+    } else if (gMicMute) { memset(t, 0, (size_t)c * sizeof(float)); } // no Stereo playing: muting the mic just means silence
+    else if (RY_FX_ON) RYVoiceBlock(t, c, sr, s);
     if (gMonOn) RYMonFeed(t, c, sr);
 }
 // interleaved: channel 0 is processed and copied to the other channels
@@ -1979,8 +1989,10 @@ static NSString *RYReport(void) {
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger code))done;
 // invite pass over the visible list (Recents / Friends screen): one row at a time, 0.4s apart
 @property (nonatomic) BOOL invRunning;
+@property (nonatomic) BOOL invReadyToSend; // every circle ticked; waiting for you to press send
 @property (nonatomic) NSInteger invSent;
 @property (nonatomic, copy) NSString *invStatus;
+- (void)invSendNow;
 - (void)startInvites; - (void)stopInvites; - (NSInteger)invCooldownLeft;
 @end
 
@@ -2026,6 +2038,10 @@ static void RYMsgLoopSet(BOOL on) {
 @property (nonatomic, strong) UIStackView *stack;
 @property (nonatomic, strong) UILabel *invLabel;
 @property (nonatomic, strong) NSTimer *invUI;
+@property (nonatomic, strong) UISlider *stSlider;
+@property (nonatomic, strong) UILabel *stTimeLabel;
+@property (nonatomic, strong) NSTimer *stUI;
+@property (nonatomic) BOOL stDragging; // true while the user's finger is on the slider: stop auto-updating it so it doesn't fight the drag
 @property (nonatomic, strong) NSString *pickPurpose; // routes the shared PHPicker callback: nil/"bg" = background image, "stereo" = Stereo video
 @end
 
@@ -2254,6 +2270,16 @@ static void RYMsgLoopSet(BOOL on) {
         [ws rebuild];
     });
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تكرار", @"Loop"), 14, UIFontWeightMedium, nil), lp], 12), play])];
+    // scrub bar: shows where the clip is and lets you drag forward/back, same clip the mic is playing
+    UISlider *pos = [UISlider new]; pos.minimumValue = 0; pos.maximumValue = (float)MAX(RYStDuration(), 0.01); pos.value = (float)RYStPosSec();
+    pos.minimumTrackTintColor = RYAccent(); self.stSlider = pos;
+    UILabel *tlab = RYLabel([self stTimeText], 12, UIFontWeightMedium, RY_MUTED); tlab.textAlignment = NSTextAlignmentCenter; self.stTimeLabel = tlab;
+    __weak UISlider *wpos = pos;
+    [pos addAction:[UIAction actionWithHandler:^(UIAction *a) { ws.stDragging = YES; ws.stTimeLabel.text = [ws stTimeTextFor:wpos.value]; }] forControlEvents:UIControlEventTouchDown];
+    [pos addAction:[UIAction actionWithHandler:^(UIAction *a) { ws.stTimeLabel.text = [ws stTimeTextFor:wpos.value]; }] forControlEvents:UIControlEventValueChanged];
+    [pos addAction:[UIAction actionWithHandler:^(UIAction *a) { RYStSeek(wpos.value); ws.stDragging = NO; }] forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    [self.stack addArrangedSubview:RYCard(@[pos, tlab])];
+    [self startStUI];
     [self.stack addArrangedSubview:RYSlider(T(@"مستوى الصوت", @"Volume"), 0, 2, gStVol, ^(float v) { gStVol = v; CS(@"stVol", @(v)); })];
     NSArray *clips = CF(@"stClips", @[]);
     if (clips.count) {
@@ -2279,11 +2305,23 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack addArrangedSubview:RYCard(rows)];
     }
 }
+static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(s + 0.5); return [NSString stringWithFormat:@"%ld:%02ld", (long)(t / 60), (long)(t % 60)]; }
+- (NSString *)stTimeTextFor:(double)posSec { return [NSString stringWithFormat:@"%@ / %@", RYMMSS(posSec), RYMMSS(RYStDuration())]; }
+- (NSString *)stTimeText { return [self stTimeTextFor:RYStPosSec()]; }
+- (void)startStUI {
+    [self.stUI invalidate]; __weak typeof(self) ws = self;
+    self.stUI = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) {
+        if (!ws.stSlider) { [t invalidate]; return; }
+        ws.stSlider.maximumValue = (float)MAX(RYStDuration(), 0.01);
+        if (!ws.stDragging) { ws.stSlider.value = (float)RYStPosSec(); ws.stTimeLabel.text = [ws stTimeText]; }
+    }];
+}
 
 #pragma mark Invites
 - (NSString *)invText {
     RYCore *c = [RYCore shared];
-    if (c.invRunning) return [NSString stringWithFormat:T(@"شغّال… انرسل %ld دعوة\n%@", @"Running… %ld sent\n%@"), (long)c.invSent, c.invStatus ?: @""];
+    if (c.invReadyToSend) return [NSString stringWithFormat:T(@"انحدد %ld. اضغط \"إرسال الآن\".", @"%ld selected. Press \"Send now\"."), (long)c.invSent];
+    if (c.invRunning) return [NSString stringWithFormat:T(@"شغّال… حُدّد %ld\n%@", @"Running… %ld selected\n%@"), (long)c.invSent, c.invStatus ?: @""];
     NSInteger left = [c invCooldownLeft];
     if (left > 0) return [NSString stringWithFormat:T(@"آخر تشغيل: %ld دعوة. تقدر تشغّل بعد %ld:%02ld", @"Last run: %ld sent. Available again in %ld:%02ld"), (long)c.invSent, (long)(left / 60), (long)(left % 60)];
     return c.invStatus.length ? c.invStatus : T(@"جاهز", @"Ready");
@@ -2303,7 +2341,14 @@ static void RYMsgLoopSet(BOOL on) {
         [ws presentViewController:a animated:YES completion:nil];
     });
     UIButton *stop = RYBtn(T(@"إيقاف", @"Stop"), NO, ^{ [[RYCore shared] stopInvites]; });
-    [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYHStack(@[go, stop], 8)])];
+    UIButton *sendNow = RYBtn(T(@"إرسال الآن", @"Send now"), YES, ^{
+        RYCore *c = [RYCore shared]; if (!c.invReadyToSend) return;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:T(@"تأكيد", @"Confirm") message:[NSString stringWithFormat:T(@"إرسال الدعوة لكل الـ %ld اللي اتحددوا؟", @"Send the invite to all %ld selected?"), (long)c.invSent] preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:T(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+        [a addAction:[UIAlertAction actionWithTitle:T(@"إرسال", @"Send") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [c invSendNow]; }]];
+        [ws presentViewController:a animated:YES completion:nil];
+    });
+    [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYHStack(@[go, stop], 8), sendNow])];
     [self startInvUI];
 }
 - (void)startInvUI {
@@ -2888,60 +2933,89 @@ static void RYRowDump(UIView *cell) {
     if (self.bgView.stamp != self.stamp) { [self.bgView apply]; self.bgView.stamp = self.stamp; }
 }
 - (NSInteger)invCooldownLeft { if (!gInvLast) return 0; NSInteger l = (NSInteger)(240 - ([NSDate date].timeIntervalSince1970 - gInvLast)); return l > 0 ? l : 0; }
-- (void)stopInvites {
-    [gInvTimer invalidate]; gInvTimer = nil;
-    if (self.invRunning) {
-        self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow();
-        self.invStatus = [NSString stringWithFormat:T(@"وقف. انرسل %ld.", @"Stopped. %ld sent."), (long)self.invSent];
-    }
-}
 - (void)startInvites {
     if (self.invRunning || [self invCooldownLeft] > 0) return;
-    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; gInvSV = nil; gInvRetry = [NSMutableDictionary new]; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
+    gInvDone = [NSMutableSet new]; gInvIdle = 0; gInvLog = [NSMutableString new]; gInvOK = 0; self.invSent = 0; self.invRunning = YES; self.invReadyToSend = NO; gInvSV = nil; gInvRetry = [NSMutableDictionary new]; self.invStatus = T(@"أبحث عن القائمة…", @"Looking for the list…");
     gInvEndT = 0; gInvNextT = 0;
     gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
+}
+- (void)stopInvites {
+    [gInvTimer invalidate]; gInvTimer = nil;
+    if (self.invRunning || self.invReadyToSend) {
+        self.invRunning = NO; self.invReadyToSend = NO; if (gInvOK > 0) gInvLast = RYNow();
+        self.invStatus = [NSString stringWithFormat:T(@"وقف. حُدّد %ld.", @"Stopped. %ld selected."), (long)self.invSent];
+    }
 }
 - (void)invFinish:(NSString *)why {
     [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow();
     self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
-    if (gInvOK == 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما ارسلت لحد، انسخت التفاصيل", @" - nothing got sent, details copied")]; }
+    if (gInvOK == 0 && gInvLog.length) { UIPasteboard.generalPasteboard.string = gInvLog; self.invStatus = [self.invStatus stringByAppendingString:T(@" — ما تحدد أحد، انسخت التفاصيل", @" - nothing got selected, details copied")]; }
 }
-// one row at a time: find the next not-yet-done row with its own invite button, tap it (one send), wait 0.4s, move on.
-// never batches, never presses a bulk "send all" button — exactly one invite leaves per tap, paced like a person doing it by hand.
+- (void)invWaitForSend:(NSString *)why {
+    [gInvTimer invalidate]; gInvTimer = nil; self.invRunning = NO; if (gInvOK > 0) gInvLast = RYNow();
+    self.invReadyToSend = YES;
+    self.invStatus = [NSString stringWithFormat:@"%@ %ld", why, (long)self.invSent];
+}
+- (void)invSendNow {
+    if (!self.invReadyToSend) return;
+    self.invReadyToSend = NO; self.invStatus = T(@"جاري الإرسال…", @"Sending…"); self.invRunning = YES;
+    [self invPressSend:YES];
+    gInvTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(invStep) userInfo:nil repeats:YES];
+}
+- (void)invPressSend:(BOOL)final {
+    NSInteger c = 0; UIView *b = RYFindSendBtn(&c);
+    BOOL ok = b ? RYTapAncestors(b) : NO;
+    [gInvLog appendFormat:@"send button %@ (%ld selected) pressed=%d\n", b ? NSStringFromClass(b.class) : @"NOT FOUND", (long)c, ok];
+    if (!ok) { UIPasteboard.generalPasteboard.string = gInvLog; [self invFinish:T(@"ما قدرت أضغط زر الإرسال (انسخت التفاصيل). المحدد:", @"Could not press the send button (details copied). Selected:")]; return; }
+    self.invStatus = [NSString stringWithFormat:T(@"ضغط إرسال (%ld)", @"Pressed send (%ld)"), (long)c];
+    gInvSending = YES; gInvSendUntil = RYNow() + (final ? 1.2 : 1.5); gInvFinalSend = final;
+}
+// the circle (RYCircleIn), not the keyword-matched "invite button": one circle at a time, 0.4s apart, every circle
+// currently on screen before scrolling for more. Once the whole list is done, stop and wait for you to press send.
 - (void)invStep {
     NSTimeInterval now = RYNow();
+    if (gInvSending) {
+        if (now < gInvSendUntil) return;
+        gInvSending = NO;
+        if (gInvFinalSend) { [self invFinish:T(@"خلصت وانرسلت الدعوات. المحدد:", @"Done, invites sent. Selected:")]; return; }
+    }
     if (now < gInvNextT) return;
     UIScrollView *sv = RYBiggestList();
-    if (!sv) { if (++gInvIdle > 30) [self invFinish:T(@"ما لقيت قائمة بالشاشة. انرسل:", @"No list on screen. Sent:")]; return; }
-    UIView *target = nil; id ctl = nil;
+    if (!sv) { if (++gInvIdle > 30) [self invFinish:T(@"ما لقيت قائمة بالشاشة. المحدد:", @"No list on screen. Selected:")]; return; }
+    UIView *target = nil; NSString *targetKey = nil;
     for (UIView *cell in RYVisibleCells(sv)) {
         NSMutableString *key = [NSMutableString new]; RYCellTexts(cell, key, 0);
         if (!key.length) [key appendFormat:@"%p", cell];
         if ([gInvDone containsObject:key]) continue;
-        id c = RYInviteCtl(cell);
-        if (!c) {
+        UIView *circle = RYCircleIn(cell);
+        if (!circle) {
             NSNumber *miss = gInvRetry[key];
-            if (!miss) { gInvRetry[key] = @1; continue; } // first miss: try again next tick instead of giving up immediately
-            [gInvDone addObject:key]; continue; // missed twice: no invite button on this row for real (already invited / not a person row)
+            if (!miss) { gInvRetry[key] = @1; continue; } // first miss: layout may not be settled yet, try once more next tick
+            [gInvDone addObject:key]; continue; // missed twice: no circle on this row for real (already invited / not a person row)
         }
-        target = cell; ctl = c; [gInvDone addObject:key]; break;
+        target = cell; targetKey = key; break;
     }
     if (target) {
-        RYActivateCtl(ctl);
-        self.invSent++; gInvOK++; gInvIdle = 0; gInvEndT = 0;
-        self.invStatus = [NSString stringWithFormat:T(@"انرسل لـ %ld…", @"Sent to %ld…"), (long)self.invSent];
-        gInvNextT = now + 0.4; // the pacing the user asked for: one person, then wait, then the next
+        BOOL ticked = NO;
+        for (NSInteger m = 0; m <= 1; m++) if (RYSelectRow(sv, target, m)) { ticked = YES; break; } // m0/m1 = tap the circle itself, two ways
+        [gInvDone addObject:targetKey]; gInvIdle = 0; gInvEndT = 0;
+        if (ticked) { self.invSent++; gInvOK++; self.invStatus = [NSString stringWithFormat:T(@"حُدّد %ld…", @"Selected %ld…"), (long)self.invSent]; }
+        else [gInvLog appendFormat:@"circle could not be ticked: %@\n", RYClip(targetKey, 30)];
+        gInvNextT = now + 0.4; // one circle, then wait, then the next
         return;
     }
     CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
-    if (sv.contentOffset.y >= maxY - 2) { // at the bottom with nobody new: wait a moment for more rows to load, then stop
+    if (sv.contentOffset.y >= maxY - 2) { // at the bottom with nothing left to tick: wait a moment (more rows may load), then stop and wait for you to send
         if (!gInvEndT) gInvEndT = now;
-        if (now - gInvEndT > 1.5) [self invFinish:T(@"خلصت القائمة. انرسل:", @"Reached the end. Sent:")];
+        if (now - gInvEndT > 1.2) {
+            if (gInvOK > 0) [self invWaitForSend:T(@"خلصت القائمة. اضغط إرسال للمحدد:", @"Reached the end. Press send for the selected:")];
+            else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")];
+        }
     } else {
         gInvEndT = 0;
         [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
         [sv layoutIfNeeded];
-        gInvNextT = now + 0.15; // give the list a moment to lay out the newly-scrolled-in rows before looking again
+        gInvNextT = now + 0.15; // let the newly-scrolled-in rows lay out before looking at them
     }
 }
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
