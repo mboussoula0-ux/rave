@@ -2560,7 +2560,7 @@ static void RYCellTexts(UIView *v, NSMutableString *o, int d) {
 static id RYInviteCtl(UIView *cell) {
     NSMutableArray *c = [NSMutableArray new]; RYCollectCtl(cell, c, 0);
     NSArray *good = @[@"invite", @"دعو", @"دعوه", @"add to room", @"person.badge.plus", @"plus"];
-    NSArray *bad = @[@"invited", @"تمت", @"تم ", @"sent", @"pending", @"remove", @"block", @"report", @"unfriend", @"chat", @"message"];
+    NSArray *bad = @[@"invited", @"تمت", @"تم ", @"sent", @"pending", @"remove", @"block", @"report", @"unfriend", @"chat", @"message", @"cancel", @"cancelinvite", @"cancelfriendinvite", @"delete", @"decline", @"deny"];
     for (UIControl *b in c) {
         NSString *k = RYCtlKey(b); BOOL skip = NO;
         for (NSString *w in bad) if ([k containsString:w]) { skip = YES; break; }
