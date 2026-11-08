@@ -1408,19 +1408,26 @@ static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
 }
 // ---- monitor: hear your own processed voice (what the others hear) through the phone's output. A ring buffer is fed by the capture routes below.
 static float gMonRing[65536]; static volatile unsigned gMonW = 0, gMonR = 0; static double gMonSR = 48000; static AVAudioEngine *gMonEng;
-static void RYMonFeed(const float *x, int n, double sr) {
-    if (!gMonOn) return; gMonSR = sr; unsigned w = gMonW;
+static volatile int gStMon = 1; // "hear the Stereo file myself": plays ONLY the file (not my voice) through the phone's output, in sync with what the room hears
+static void RYMonPush(const float *x, int n, double sr) {
+    gMonSR = sr; unsigned w = gMonW;
     for (int i = 0; i < n; i++) gMonRing[(w + (unsigned)i) & 65535] = x[i];
     __sync_synchronize(); gMonW = w + (unsigned)n;
 }
-static void RYMonStop(void) {
-    gMonOn = 0; AVAudioEngine *e = gMonEng; gMonEng = nil;
+static void RYMonFeed(const float *x, int n, double sr) { if (!gMonOn) return; RYMonPush(x, n, sr); }
+static void RYMonEngineStop(void) {
+    AVAudioEngine *e = gMonEng; gMonEng = nil;
     if (e) dispatch_async(dispatch_get_main_queue(), ^{ [e stop]; });
 }
-static void RYMonStart(void) {
-    gMonOn = 1; gMonR = gMonW;
+static void RYMonStop(void) {
+    gMonOn = 0;
+    if (gStMon && gStOn) return;   // the Stereo monitor is still using the engine
+    RYMonEngineStop();
+}
+// starts the local-playback engine if it is not running yet (used by "Hear my voice" and by "Hear it myself" in the Stereo tab)
+static void RYMonEngineStart(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (gMonEng || !gMonOn) return;
+        if (gMonEng || !(gMonOn || (gStMon && gStOn))) return;
         AVAudioFormat *fmt = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:(gMonSR > 0 ? gMonSR : 48000) channels:1];
         __block BOOL primed = NO;
         AVAudioSourceNode *src = [[AVAudioSourceNode alloc] initWithFormat:fmt renderBlock:^OSStatus(BOOL *silence, const AudioTimeStamp *ts, AVAudioFrameCount frames, AudioBufferList *out) {
@@ -1439,12 +1446,21 @@ static void RYMonStart(void) {
         gMonEng = e;
         static dispatch_once_t once; dispatch_once(&once, ^{
             [NSNotificationCenter.defaultCenter addObserverForName:AVAudioEngineConfigurationChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
-                AVAudioEngine *g = gMonEng; if (gMonOn && g && !g.isRunning) [g startAndReturnError:nil];
+                AVAudioEngine *g = gMonEng; if ((gMonOn || (gStMon && gStOn)) && g && !g.isRunning) [g startAndReturnError:nil];
             }];
         });
     });
 }
+static void RYMonStart(void) { gMonOn = 1; gMonR = gMonW; RYMonEngineStart(); }
+// start the Stereo file from the beginning, and (if enabled) start hearing it locally
+static void RYStPlay(void) { gStPos = 0; gMonR = gMonW; gStOn = 1; if (gStMon) RYMonEngineStart(); }
+static void RYStMonSet(BOOL on) {
+    gStMon = on ? 1 : 0; CS(@"stMon", @(on));
+    if (on && gStOn) { gMonR = gMonW; RYMonEngineStart(); }
+    else if (!on && !gMonOn) RYMonEngineStop();
+}
 static inline void RYMicFx(float *t, int c, double sr, RYVS *s) {
+    gMonSR = sr; // remembered even while the monitor is off, so the engine starts at the real capture rate
     if (gStOn) {
         // "سكر صوتي" only has to silence YOUR voice, not the Stereo file: RYStFeed always runs here regardless of gMicMute,
         // and RYVoiceBlock (called below on tmp, your real voice) already zeroes itself out on its own when gMicMute is on.
@@ -1454,6 +1470,7 @@ static inline void RYMicFx(float *t, int c, double sr, RYVS *s) {
             memcpy(tmp, t + done, (size_t)n * sizeof(float));
             RYVoiceBlock(tmp, n, sr, s);                 // tmp = your real voice, exactly as it would normally sound (silence if muted)
             RYStFeed(t + done, n, sr);                    // t[] = the Stereo file, always at full clarity
+            if (gStMon && !gMonOn) RYMonPush(t + done, n, sr); // I hear the file itself, at the same moment the room does (when "Hear my voice" is on, the mixed signal below is monitored instead)
             for (int i = 0; i < n; i++) { float v = t[done + i] + tmp[i] * 0.55f; t[done + i] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); }
             done += n;
         }
@@ -1705,7 +1722,7 @@ static void RYMicLoad(void) {
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicPreset = [CF(@"micPreset", @0) intValue]; gMicSemi = [CF(@"micSemi", @0) floatValue];
     gMicMode = [CF(@"micMode", @0) intValue]; gMicEcho = [CF(@"micEcho", @0) floatValue]; gMicGain = [CF(@"micGain", @1) floatValue];
     gMicDist = [CF(@"micDist", @NO) boolValue]; gMicRev = [CF(@"micRev", @NO) boolValue]; gMicMute = 0; // never restore "on": always starts unmuted so it's never silently stuck
-    gStLoop = [CF(@"stLoop", @NO) boolValue]; gStVol = [CF(@"stVol", @1.0) floatValue];
+    gStLoop = [CF(@"stLoop", @NO) boolValue]; gStVol = [CF(@"stVol", @1.0) floatValue]; gStMon = [CF(@"stMon", @YES) boolValue];
     { NSArray *rc = CF(@"revCfg", nil); // the saved echo settings only count if they were saved with the current defaults (version 2); otherwise start from the Dragonfly values
       if ([CF(@"revCfgVer", @0) intValue] == 2 && [rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue];
       else { NSMutableArray *d = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) { gRv[i] = kRvDef[i]; [d addObject:@(kRvDef[i])]; } CS(@"revCfg", d); CS(@"revCfgVer", @2); } }
@@ -2353,10 +2370,14 @@ static void RYMsgLoopSet(BOOL on) {
     [lp addAction:[UIAction actionWithHandler:^(UIAction *a) { gStLoop = wlp.on; CS(@"stLoop", @(wlp.on)); }] forControlEvents:UIControlEventValueChanged];
     UIButton *play = RYBtn(gStOn ? T(@"إيقاف", @"Stop") : T(@"تشغيل بالمايك", @"Play through mic"), gStOn, ^{
         if (!gStBuf || gStLen <= 1) { [ws toast:T(@"اختر ملف أول", @"Choose a file first")]; return; }
-        if (gStOn) { gStOn = 0; } else { gStPos = 0; gStOn = 1; }
+        if (gStOn) { gStOn = 0; if (!gMonOn) RYMonEngineStop(); } else { RYStPlay(); }
         [ws rebuild];
     });
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تكرار", @"Loop"), 14, UIFontWeightMedium, nil), lp], 12), play])];
+    UISwitch *hm = [UISwitch new]; hm.on = gStMon != 0; hm.onTintColor = RYAccent(); __weak UISwitch *whm = hm;
+    [hm addAction:[UIAction actionWithHandler:^(UIAction *a) { RYStMonSet(whm.on); }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"أسمع الملف أنا كمان", @"Hear it myself"), 14, UIFontWeightMedium, nil), hm], 12),
+        RYLabel(T(@"تسمع الملف نفسه بنفس لحظة ما الروم يسمعونه (بدون صوتك). استخدم سماعة عشان المايك ما يلتقطه مرة ثانية.", @"You hear the file itself at the same moment the room does (not your voice). Use headphones so the mic does not pick it up again."), 12, UIFontWeightRegular, RY_MUTED)])];
     // scrub bar: shows where the clip is and lets you drag forward/back, same clip the mic is playing
     UISlider *pos = [UISlider new]; pos.minimumValue = 0; pos.maximumValue = (float)MAX(RYStDuration(), 0.01); pos.value = (float)RYStPosSec();
     pos.minimumTrackTintColor = RYAccent(); self.stSlider = pos;
@@ -2379,7 +2400,7 @@ static void RYMsgLoopSet(BOOL on) {
                 [ws toast:T(@"جاري التحميل…", @"Loading…")];
                 RYStDecode([NSURL fileURLWithPath:path], ^(BOOL ok, NSString *msg) {
                     if (!ok) { [ws toast:msg ?: T(@"تعذر التحميل", @"Could not load")]; return; }
-                    CS(@"stName", cname); CS(@"stFile", cfile); gStPos = 0; gStOn = 1; [ws rebuild];
+                    CS(@"stName", cname); CS(@"stFile", cfile); RYStPlay(); [ws rebuild];
                 });
             });
             UIButton *cdel = RYBtn(T(@"حذف", @"Remove"), NO, ^{
