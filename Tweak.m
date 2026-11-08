@@ -99,8 +99,54 @@ static NSString *RYHash(NSString *s) {
     return o;
 }
 static BOOL RYLocked(void) {
-    NSString *h = CF(@"keyHash", @"");
-    return h.length > 0 && ![CF(@"unlocked", @NO) boolValue];
+    return ![CF(@"unlocked", @NO) boolValue];
+}
+
+#pragma mark - Licence (server-checked key, one device per key)
+
+#define RY_LIC_API @"https://empty-moon-c2f7.mboussoula0.workers.dev"
+
+static NSString *RYDeviceId(void) {
+    NSString *d = CF(@"devId", nil);
+    if (d.length) return d;
+    NSString *v = [UIDevice.currentDevice.identifierForVendor UUIDString] ?: NSUUID.UUID.UUIDString;
+    CS(@"devId", v);
+    return v;
+}
+static NSString *RYPct(NSString *s) { return [s stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet] ?: s; }
+
+// Calls /activate with the typed key. On success the key hash + unlocked flag are cached locally,
+// so the panel opens straight away from then on without asking again.
+static void RYLicActivate(NSString *key, void (^done)(BOOL ok, NSString *reason)) {
+    NSString *h = RYHash(key);
+    NSURL *u = [NSURL URLWithString:[RY_LIC_API stringByAppendingString:@"/activate"]];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 10; r.HTTPMethod = @"POST";
+    [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    r.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"hash": h, @"device": RYDeviceId()} options:0 error:nil];
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        BOOL ok = NO; NSString *reason = @"network";
+        if (d) { id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; if ([j isKindOfClass:NSDictionary.class]) { ok = [j[@"ok"] boolValue]; reason = j[@"reason"] ?: reason; } }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (ok) { CS(@"licHash", h); CS(@"unlocked", @YES); CS(@"licTs", @(NSDate.date.timeIntervalSince1970)); }
+            done(ok, reason);
+        });
+    }] resume];
+}
+
+// Silent background re-check of the key already saved on this device (no UI). If the owner has
+// since turned the key off / revoked / changed devices, this flips us back to locked.
+static void RYLicRevalidate(void) {
+    NSString *h = CF(@"licHash", nil);
+    if (!h.length || RYLocked()) return;
+    NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"%@/check?hash=%@&device=%@", RY_LIC_API, RYPct(h), RYPct(RYDeviceId())]];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 8;
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        if (!d) return; // offline: keep whatever we already had, don't punish a dropped connection
+        id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        BOOL ok = [j isKindOfClass:NSDictionary.class] && [j[@"ok"] boolValue];
+        if (ok) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ CS(@"unlocked", @NO); });
+    }] resume];
 }
 
 #pragma mark - UI helpers
@@ -2129,13 +2175,18 @@ static void RYMsgLoopSet(BOOL on) {
 #pragma mark Locked
 - (void)renderLocked {
     __weak typeof(self) ws = self;
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"اللوحة مقفلة", @"Panel is locked"), 17, UIFontWeightBold, nil),
-        RYBtn(T(@"فتح", @"Unlock"), YES, ^{
-            [ws ask:T(@"المفتاح", @"Key") ph:@"" secure:YES ok:^(NSString *s) {
-                if ([RYHash(s) isEqualToString:CF(@"keyHash", @"")]) { CS(@"unlocked", @YES); [ws rebuild]; }
-                else [ws toast:T(@"المفتاح غلط", @"Wrong key")];
-            }];
-        })])];
+    UILabel *status = RYLabel(@"", 13, UIFontWeightMedium, RY_MUTED);
+    UIButton *btn = RYBtn(T(@"فتح", @"Unlock"), YES, ^{
+        [ws ask:T(@"المفتاح", @"Key") ph:@"" secure:YES ok:^(NSString *s) {
+            if (s.length < 3) { [ws toast:T(@"المفتاح غلط", @"Wrong key")]; return; }
+            status.text = T(@"جاري التحقق…", @"Checking…");
+            RYLicActivate(s, ^(BOOL ok, NSString *reason) {
+                if (ok) { [ws rebuild]; return; }
+                status.text = @""; [ws toast:T(@"المفتاح غلط", @"Wrong key")];
+            });
+        }];
+    });
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"اللوحة مقفلة", @"Panel is locked"), 17, UIFontWeightBold, nil), btn, status])];
 }
 
 #pragma mark Backgrounds
@@ -2572,14 +2623,9 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
         RYBtn(T(@"عرض المحذوفة المحفوظة", @"Show saved messages"), YES, ^{ [ws showDeleted]; }),
         RYBtn(T(@"مسح قائمة المحذوفة", @"Clear deleted list"), NO, ^{ RYClearDeleted(); [ws rebuild]; [ws toast:T(@"انمسحت", @"Cleared")]; })])];
 
-    NSMutableArray *key = [NSMutableArray arrayWithObject:RYLabel(T(@"مفتاح الفتح", @"Unlock key"), 15, UIFontWeightBold, nil)];
-    [key addObject:RYBtn(T(@"تعيين / تغيير المفتاح", @"Set / change key"), NO, ^{
-        [ws ask:T(@"مفتاح جديد (3 أحرف أو أكثر)", @"New key (3+ chars)") ph:@"" secure:YES ok:^(NSString *s) {
-            if (s.length < 3) { [ws toast:T(@"المفتاح قصير", @"Key too short")]; return; }
-            CS(@"keyHash", RYHash(s)); CS(@"unlocked", @YES); [ws rebuild]; [ws toast:T(@"تم حفظ المفتاح", @"Key saved")];
-        }];
-    })];
-    if (CF(@"keyHash", nil)) [key addObject:RYBtn(T(@"قفل مرة ثانية", @"Lock again"), YES, ^{ CS(@"unlocked", @NO); [ws rebuild]; })];
+    NSMutableArray *key = [NSMutableArray arrayWithObject:RYLabel(T(@"المفتاح", @"Key"), 15, UIFontWeightBold, nil)];
+    [key addObject:RYLabel(RYLocked() ? T(@"الحالة: مقفول", @"Status: locked") : T(@"الحالة: مفتوح", @"Status: unlocked"), 13, UIFontWeightRegular, RY_MUTED)];
+    if (!RYLocked()) [key addObject:RYBtn(T(@"قفل / تغيير المفتاح", @"Lock / change key"), YES, ^{ CS(@"unlocked", @NO); CS(@"licHash", nil); [ws rebuild]; })];
     [self.stack addArrangedSubview:RYCard(key)];
 
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"نسخ احتياطي", @"Backup"), 15, UIFontWeightBold, nil),
@@ -2603,7 +2649,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
         })])];
 }
 - (void)exportCfg {
-    NSMutableDictionary *d = [gCfg mutableCopy]; [d removeObjectsForKeys:@[@"keyHash", @"unlocked"]];
+    NSMutableDictionary *d = [gCfg mutableCopy]; [d removeObjectsForKeys:@[@"licHash", @"unlocked", @"devId"]];
     NSData *j = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingPrettyPrinted error:nil];
     if (!j) { [self toast:T(@"فشل التصدير", @"Export failed")]; return; }
     UIPasteboard.generalPasteboard.string = [[NSString alloc] initWithData:j encoding:NSUTF8StringEncoding];
@@ -2877,6 +2923,7 @@ static void RYRowDump(UIView *cell) {
     b.center = CGPointMake([CF(@"bx", @(sz.width - 40)) doubleValue], [CF(@"by", @(sz.height * 0.35)) doubleValue]);
     b.hidden = YES; [root.view addSubview:b]; self.fab = b;
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0.8 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+    RYLicRevalidate();
 }
 - (void)pan:(UIPanGestureRecognizer *)g {
     UIView *v = g.view; CGPoint t = [g translationInView:v.superview];
@@ -2904,6 +2951,7 @@ static void RYRowDump(UIView *cell) {
     if (in && !self.wasIn && [CF(@"autoOpen", @NO) boolValue] && !RYLocked()) [self openPanel];
     if (in != self.wasIn) RYLog(in ? @"room: opened" : @"room: CLOSED (app state %ld)", (long)UIApplication.sharedApplication.applicationState);
     self.wasIn = in;
+    static int licTick = 0; if (++licTick % 90 == 0) RYLicRevalidate(); // ~every 72s
     [self syncBG:room];
     static int brandTick = 0; brandTick++;
     NSString *pat = ([CF(@"brandOn", @NO) boolValue] && brandTick % 5 == 1) ? CF(@"brand", RY_BRAND_TOKENS) : @""; // logo walk only every ~4s: keeps the main thread free
@@ -3001,13 +3049,13 @@ static void RYRowDump(UIView *cell) {
         [gInvDone addObject:targetKey]; gInvIdle = 0; gInvEndT = 0;
         if (ticked) { self.invSent++; gInvOK++; self.invStatus = [NSString stringWithFormat:T(@"حُدّد %ld…", @"Selected %ld…"), (long)self.invSent]; }
         else [gInvLog appendFormat:@"circle could not be ticked: %@\n", RYClip(targetKey, 30)];
-        gInvNextT = now + 0.4; // one circle, then wait, then the next
+        gInvNextT = now + 0.4 / 6.0; // one circle, then wait, then the next — 6x faster, as asked
         return;
     }
     CGFloat maxY = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.size.height;
     if (sv.contentOffset.y >= maxY - 2) { // at the bottom with nothing left to tick: wait a moment (more rows may load), then stop and wait for you to send
         if (!gInvEndT) gInvEndT = now;
-        if (now - gInvEndT > 1.2) {
+        if (now - gInvEndT > 1.2 / 6.0) {
             if (gInvOK > 0) [self invWaitForSend:T(@"خلصت القائمة. اضغط إرسال للمحدد:", @"Reached the end. Press send for the selected:")];
             else [self invFinish:T(@"خلصت القائمة. المحدد:", @"Reached the end. Selected:")];
         }
@@ -3015,7 +3063,7 @@ static void RYRowDump(UIView *cell) {
         gInvEndT = 0;
         [sv setContentOffset:CGPointMake(sv.contentOffset.x, MIN(maxY, sv.contentOffset.y + sv.bounds.size.height * 0.8)) animated:NO];
         [sv layoutIfNeeded];
-        gInvNextT = now + 0.15; // let the newly-scrolled-in rows lay out before looking at them
+        gInvNextT = now + 0.15 / 6.0; // let the newly-scrolled-in rows lay out before looking at them
     }
 }
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
