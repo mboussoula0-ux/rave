@@ -291,6 +291,32 @@ static void RYLog(NSString *fmt, ...) {
     if ([h seekToEndOfFile] > 60000) [h truncateFileAtOffset:0];
     [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [h closeFile];
 }
+
+#pragma mark - Audio recovery (the others in the room go silent after you step down from the mic)
+// When the mic stops, the app re-configures the shared audio session. If the output ends up on the earpiece
+// (or the session stays inactive) the room is still connected but you hear nothing. We note whether the
+// loudspeaker was in use and, right after the mic stops / the category changes / an interruption ends, make sure
+// the session is active and (only if it fell back to the earpiece with nothing plugged in) put the sound back on the speaker.
+static BOOL gLastSpkr = NO;
+static void RYNoteRoute(void) {
+    for (AVAudioSessionPortDescription *p in AVAudioSession.sharedInstance.currentRoute.outputs)
+        if ([p.portType isEqualToString:AVAudioSessionPortBuiltInSpeaker]) { gLastSpkr = YES; return; }
+}
+static void RYAudioRecover(NSString *why) {
+    static CFAbsoluteTime last = 0; CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - last < 1.5) return; last = now;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        AVAudioSession *s = AVAudioSession.sharedInstance; NSError *e = nil;
+        BOOL recv = NO, other = NO;
+        for (AVAudioSessionPortDescription *p in s.currentRoute.outputs) {
+            if ([p.portType isEqualToString:AVAudioSessionPortBuiltInReceiver]) recv = YES;
+            else if (![p.portType isEqualToString:AVAudioSessionPortBuiltInSpeaker]) other = YES; // headphones / bluetooth / car: leave alone
+        }
+        [s setActive:YES error:&e];
+        if (recv && !other && gLastSpkr) [s overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:nil];
+        RYLog(@"audio: recover (%@) category=%@ mode=%@ earpiece=%d speakerBefore=%d err=%@", why, s.category, s.mode, recv, gLastSpkr, e);
+    });
+}
 static NSString *RYLogTail(void) {
     NSString *t = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @"";
     return t.length > 3500 ? [t substringFromIndex:t.length - 3500] : t;
@@ -305,9 +331,12 @@ static void RYStartEventLog(void) {
     for (NSString *n in names) { NSString *msg = names[n]; [nc addObserverForName:n object:nil queue:nil usingBlock:^(NSNotification *x) { RYLog(@"%@", msg); }]; }
     [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:nil usingBlock:^(NSNotification *x) {
         RYLog(@"audio: interruption type=%@ reason=%@", x.userInfo[AVAudioSessionInterruptionTypeKey], x.userInfo[AVAudioSessionInterruptionReasonKey]);
+        if ([x.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue] == AVAudioSessionInterruptionTypeEnded) RYAudioRecover(@"interruption ended");
     }];
     [nc addObserverForName:AVAudioSessionRouteChangeNotification object:nil queue:nil usingBlock:^(NSNotification *x) {
         RYLog(@"audio: route change reason=%@", x.userInfo[AVAudioSessionRouteChangeReasonKey]);
+        RYNoteRoute();
+        if ([x.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue] == AVAudioSessionRouteChangeReasonCategoryChange) RYAudioRecover(@"category change");
     }];
 }
 
@@ -2959,6 +2988,12 @@ static void RYRowDump(UIView *cell) {
     if (in != self.wasIn) RYLog(in ? @"room: opened" : @"room: CLOSED (app state %ld)", (long)UIApplication.sharedApplication.applicationState);
     self.wasIn = in;
     static int licTick = 0; if (++licTick % 90 == 0) RYLicRevalidate(); // ~every 72s
+    { // mic capture was running and has now stopped (you stepped down): put the room's sound back
+        static long long lastCalls = 0; static int idleTicks = 0; static BOOL capturing = NO;
+        long long calls = gMicCallsA + gMicCallsU + gMicCallsT;
+        if (calls != lastCalls) { lastCalls = calls; idleTicks = 0; capturing = YES; RYNoteRoute(); }
+        else if (capturing && ++idleTicks >= 2) { capturing = NO; RYAudioRecover(@"mic stopped"); }
+    }
     [self syncBG:room];
     static int brandTick = 0; brandTick++;
     NSString *pat = ([CF(@"brandOn", @NO) boolValue] && brandTick % 5 == 1) ? CF(@"brand", RY_BRAND_TOKENS) : @""; // logo walk only every ~4s: keeps the main thread free
