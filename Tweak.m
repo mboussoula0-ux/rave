@@ -122,7 +122,7 @@ static void RYLicActivate(NSString *key, void (^done)(BOOL ok, NSString *reason)
     NSURL *u = [NSURL URLWithString:[RY_LIC_API stringByAppendingString:@"/activate"]];
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 10; r.HTTPMethod = @"POST";
     [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    r.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"hash": h, @"device": RYDeviceId()} options:0 error:nil];
+    r.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"key": key, @"device": RYDeviceId()} options:0 error:nil];
     [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
         BOOL ok = NO; NSString *reason = @"network";
         if (d) { id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; if ([j isKindOfClass:NSDictionary.class]) { ok = [j[@"ok"] boolValue]; reason = j[@"reason"] ?: reason; } }
@@ -145,6 +145,12 @@ static void RYLicRevalidate(void) {
         id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
         BOOL ok = [j isKindOfClass:NSDictionary.class] && [j[@"ok"] boolValue];
         if (ok) return;
+        // Only lock on a definite "no" from the server. Server hiccups / odd replies never lock a paying user.
+        NSString *why = [j isKindOfClass:NSDictionary.class] ? j[@"reason"] : nil;
+        if (![why isKindOfClass:NSString.class]) return;
+        BOOL hard = [@[@"global_off", @"not_found", @"off", @"expired", @"device_mismatch"] containsObject:why];
+        BOOL unbound = [why isEqualToString:@"not_bound"] && (NSDate.date.timeIntervalSince1970 - [CF(@"licTs", @0) doubleValue]) > 600;
+        if (!hard && !unbound) return;
         dispatch_async(dispatch_get_main_queue(), ^{ CS(@"unlocked", @NO); });
     }] resume];
 }
@@ -2183,7 +2189,7 @@ static void RYMsgLoopSet(BOOL on) {
             status.text = T(@"جاري التحقق…", @"Checking…");
             RYLicActivate(s, ^(BOOL ok, NSString *reason) {
                 if (ok) { [ws rebuild]; return; }
-                status.text = @""; [ws toast:[NSString stringWithFormat:@"DEBUG: %@", reason ?: @"nil"]]; // TEMP — remove after we fix this
+                status.text = @""; [ws toast:T(@"المفتاح غلط", @"Wrong key")];
             });
         }];
     });
