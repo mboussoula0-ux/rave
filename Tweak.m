@@ -2177,12 +2177,13 @@ static void RYMsgLoopSet(BOOL on) {
     __weak typeof(self) ws = self;
     UILabel *status = RYLabel(@"", 13, UIFontWeightMedium, RY_MUTED);
     UIButton *btn = RYBtn(T(@"فتح", @"Unlock"), YES, ^{
-        [ws ask:T(@"المفتاح", @"Key") ph:@"" secure:YES ok:^(NSString *s) {
+        [ws ask:T(@"المفتاح", @"Key") ph:@"" secure:NO ok:^(NSString *s0) {
+            NSString *s = [s0 stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].uppercaseString;
             if (s.length < 3) { [ws toast:T(@"المفتاح غلط", @"Wrong key")]; return; }
             status.text = T(@"جاري التحقق…", @"Checking…");
             RYLicActivate(s, ^(BOOL ok, NSString *reason) {
                 if (ok) { [ws rebuild]; return; }
-                status.text = @""; [ws toast:T(@"المفتاح غلط", @"Wrong key")];
+                status.text = @""; [ws toast:[NSString stringWithFormat:@"DEBUG: %@", reason ?: @"nil"]]; // TEMP — remove after we fix this
             });
         }];
     });
